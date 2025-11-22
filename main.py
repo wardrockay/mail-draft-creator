@@ -2,9 +2,10 @@ import base64
 import os
 import time
 import json
+import traceback
 from email.message import EmailMessage
 
-import functions_framework
+from flask import Flask, request, jsonify
 import requests
 
 import google.auth
@@ -19,11 +20,17 @@ SCOPES = ["https://mail.google.com/"]
 # Workspace user to impersonate
 GMAIL_USER = os.environ.get("GMAIL_USER")
 
-# Service account running on Cloud Run (same SA configured for Domain-wide Delegation)
+# Service account running on Cloud Run (same SA configurée pour Domain-wide Delegation)
 SA_EMAIL = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL")
 
 
+# --- Flask app -------------------------------------------------------
+
+app = Flask(__name__)
+
+
 # --- Debug Utils -----------------------------------------------------
+
 
 def debug(msg, data=None):
     print("\n────────── DEBUG ──────────")
@@ -38,7 +45,9 @@ def debug(msg, data=None):
 
 # --- Step 1: Call IAMCredentials API: signJwt ------------------------
 
+
 def sign_jwt_with_iam(payload: dict) -> str:
+    """Signs a JWT using the IAMCredentials API for the Cloud Run service account."""
     # Retrieve Cloud Run service account access token
     creds, _ = google.auth.default()
     creds.refresh(GoogleRequest())
@@ -79,7 +88,9 @@ def sign_jwt_with_iam(payload: dict) -> str:
 
 # --- Step 2: Exchange JWT for Google OAuth2 access token --------------
 
+
 def get_gmail_service():
+    """Builds an impersonated Gmail service using domain-wide delegation."""
     debug("ENV VARS", {
         "GMAIL_USER": GMAIL_USER,
         "SERVICE_ACCOUNT": SA_EMAIL,
@@ -130,20 +141,62 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
+# --- Signature helpers ------------------------------------------------
+
+
+def get_user_signature(service):
+    """Récupère la signature Gmail (HTML) de l'utilisateur impersoné."""
+    try:
+        send_as = service.users().settings().sendAs().get(
+            userId="me",
+            sendAsEmail=GMAIL_USER,
+        ).execute()
+
+        signature = send_as.get("signature", "")
+        debug("SIGNATURE RETRIEVED", {"signature_length": len(signature)})
+        return signature
+    except Exception as e:
+        debug("ERROR GETTING SIGNATURE", str(e))
+        return ""
+
+
 # --- Step 3: Create Gmail Draft -------------------------------------
 
+
 def create_draft(service, to, subject, body):
+    """Crée un brouillon Gmail en HTML en ajoutant la signature Gmail de l'utilisateur."""
     debug("CREATE_DRAFT INPUT", {
         "to": to,
         "subject": subject,
         "body_len": len(body),
     })
 
+    # Récupérer la signature HTML configurée dans Gmail
+    signature_html = get_user_signature(service)
+
+    # Fallback texte brut (pour les clients qui ne lisent pas le HTML)
+    plain_body = body
+    if signature_html:
+        plain_body = f"{body}\n\n-- \nSignature"
+
+    # Corps HTML : on remplace les sauts de ligne par des <br> simples
+    html_body = body.replace("\n", "<br>")
+    if signature_html:
+        # On encapsule ton texte puis on ajoute la signature HTML récupérée de Gmail
+        html_body = f"<div>{html_body}</div><br>{signature_html}"
+
+    # Construction du message multi-part (texte + HTML)
     msg = EmailMessage()
     msg["To"] = to
     msg["Subject"] = subject
-    msg.set_content(body)
 
+    # Partie texte (fallback)
+    msg.set_content(plain_body)
+
+    # Partie HTML (principale pour les clients modernes)
+    msg.add_alternative(html_body, subtype="html")
+
+    # Encodage pour l'API Gmail
     encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
     draft_body = {"message": {"raw": encoded}}
@@ -152,7 +205,7 @@ def create_draft(service, to, subject, body):
 
     draft = service.users().drafts().create(
         userId="me",
-        body=draft_body
+        body=draft_body,
     ).execute()
 
     debug("DRAFT RESPONSE", draft)
@@ -160,28 +213,44 @@ def create_draft(service, to, subject, body):
     return draft.get("id")
 
 
-# --- Cloud Run HTTP Entry --------------------------------------------
+# --- HTTP endpoint (Cloud Run) ---------------------------------------
 
-@functions_framework.http
-def hello_http(request):
+
+@app.route("/", methods=["POST"])
+def root():
+    """Endpoint HTTP Cloud Run.
+
+    Attend un JSON du type:
+    {
+      "to": "client@exemple.fr",
+      "subject": "Sujet du mail",
+      "message": "Corps du message en texte brut"
+    }
+
+    Crée un brouillon Gmail au nom de GMAIL_USER avec la signature HTML du compte.
+    """
     debug("REQUEST RECEIVED")
 
-    data = request.get_json(silent=True) or {}
+    try:
+        data = request.get_json(silent=True) or {}
+        debug("REQUEST JSON", data)
 
-    debug("REQUEST JSON", data)
+        to = data.get("to", "client@exemple.fr")
+        subject = data.get("subject", "Email automatique")
+        message = data.get("message", "Message automatique.")
 
-    to = data.get("to", "client@exemple.fr")
-    subject = data.get("subject", "Email automatique")
-    message = data.get("message", "Message automatique.")
+        debug("GETTING GMAIL SERVICE")
+        service = get_gmail_service()
+        debug("GMAIL SERVICE READY")
 
-    debug("GETTING GMAIL SERVICE")
+        draft_id = create_draft(service, to, subject, message)
+        debug("RESPONSE SENT", {"draft_id": draft_id})
 
-    service = get_gmail_service()
+        return jsonify({"status": "ok", "draft_id": draft_id}), 200
 
-    debug("GMAIL SERVICE READY")
-
-    draft_id = create_draft(service, to, subject, message)
-
-    debug("RESPONSE SENT", {"draft_id": draft_id})
-
-    return {"status": "ok", "draft_id": draft_id}
+    except Exception as e:
+        debug("UNCAUGHT ERROR", {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })
+        return jsonify({"status": "error", "error": str(e)}), 500

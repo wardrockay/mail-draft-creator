@@ -73,7 +73,7 @@ functions-framework
 ### Déploiement direct :
 
 ```
-gcloud run deploy gmail-draft-api \
+gcloud run deploy draft-creator \
   --source . \
   --region europe-west1 \
   --allow-unauthenticated \
