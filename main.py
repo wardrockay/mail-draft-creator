@@ -33,6 +33,9 @@ PIXEL_TRACKER_BASE_URL = os.environ.get("PIXEL_TRACKER_BASE_URL", "").rstrip("/"
 # Nom de la collection Firestore pour les ouvertures
 PIXEL_COLLECTION = os.environ.get("PIXEL_COLLECTION", "email_opens")
 
+# Nom de la collection Firestore pour les drafts en attente de review
+DRAFT_COLLECTION = os.environ.get("DRAFT_COLLECTION", "email_drafts")
+
 # Activer/désactiver le tracking d'email
 # true = ajoute le pixel de tracking, false = pas de tracking
 ENABLE_TRACKING = os.environ.get("ENABLE_TRACKING", "false").lower() in ("true", "1", "yes")
@@ -195,15 +198,39 @@ def get_user_signature(service):
 
 # --- Step 3: Create Gmail Draft or Send + tracking pixel -------------
 
+def save_draft_to_firestore(to, subject, body):
+    """
+    Sauvegarde un draft dans Firestore pour review humain.
+    
+    Returns:
+        draft_id: ID du document Firestore créé
+    """
+    draft_id = str(uuid.uuid4())
+    
+    try:
+        doc_ref = db.collection(DRAFT_COLLECTION).document(draft_id)
+        doc_ref.set({
+            "to": to,
+            "subject": subject,
+            "body": body,
+            "created_at": now_utc(),
+            "status": "pending",  # pending, sent, rejected
+        })
+        debug("DRAFT SAVED TO FIRESTORE", {"draft_id": draft_id})
+        return draft_id
+    except Exception as e:
+        debug("ERROR SAVING DRAFT TO FIRESTORE", str(e))
+        raise
+
+
 def create_or_send_email(service, to, subject, body, mode="draft"):
     """
-    Crée un brouillon Gmail OU envoie directement l'email en HTML :
-    - ajoute un pixel de tracking <img src=".../pixel?id=pixel_id">
-    - ajoute la signature Gmail HTML
-    - enregistre pixel_id dans Firestore (email_opens)
+    Crée un brouillon Firestore OU envoie directement l'email en HTML :
+    - mode="draft": sauvegarde dans Firestore pour review humain
+    - mode="send": envoie directement avec pixel de tracking et signature
     
     Args:
-        mode: "draft" pour créer un brouillon, "send" pour envoyer directement
+        mode: "draft" pour sauvegarder dans Firestore, "send" pour envoyer directement
     """
     debug("CREATE_OR_SEND_EMAIL INPUT", {
         "to": to,
@@ -211,6 +238,11 @@ def create_or_send_email(service, to, subject, body, mode="draft"):
         "body_len": len(body),
         "mode": mode,
     })
+
+    # En mode draft, on sauvegarde dans Firestore au lieu de créer un draft Gmail
+    if mode == "draft":
+        draft_id = save_draft_to_firestore(to, subject, body)
+        return draft_id, None
 
     # Générer un ID unique pour le pixel
     pixel_id = str(uuid.uuid4())
@@ -281,24 +313,14 @@ def create_or_send_email(service, to, subject, body, mode="draft"):
 
     debug("MESSAGE RAW (FIRST 200 CHARS)", encoded[:200])
 
-    if mode == "send":
-        # Envoi direct du message
-        message_body = {"raw": encoded}
-        sent = service.users().messages().send(
-            userId="me",
-            body=message_body,
-        ).execute()
-        debug("MESSAGE SENT RESPONSE", sent)
-        return sent.get("id"), pixel_id
-    else:
-        # Création d'un brouillon
-        draft_body = {"message": {"raw": encoded}}
-        draft = service.users().drafts().create(
-            userId="me",
-            body=draft_body,
-        ).execute()
-        debug("DRAFT CREATED RESPONSE", draft)
-        return draft.get("id"), pixel_id
+    # Mode send: envoi direct du message
+    message_body = {"raw": encoded}
+    sent = service.users().messages().send(
+        userId="me",
+        body=message_body,
+    ).execute()
+    debug("MESSAGE SENT RESPONSE", sent)
+    return sent.get("id"), pixel_id
 
 
 # --- HTTP endpoint (Cloud Run) ---------------------------------------
@@ -316,16 +338,15 @@ def root():
       "mode": "draft" ou "send" (optionnel, par défaut utilise SEND_MODE env var)
     }
 
-    Crée un brouillon OU envoie directement l'email Gmail au nom de GMAIL_USER avec :
-    - signature HTML du compte
-    - pixel de tracking (si PIXEL_TRACKER_BASE_URL est défini)
+    Mode "draft": sauvegarde dans Firestore pour review humain
+    Mode "send": envoie directement l'email avec signature et pixel de tracking
 
     Réponse:
     {
       "status": "ok",
       "mode": "draft" ou "send",
-      "id": "..." (draft_id ou message_id),
-      "pixel_id": "..."
+      "id": "..." (draft_id Firestore ou message_id Gmail),
+      "pixel_id": "..." (uniquement pour mode send)
     }
     """
     debug("REQUEST RECEIVED")
@@ -343,6 +364,15 @@ def root():
         if mode not in ["draft", "send"]:
             mode = "draft"
 
+        # En mode draft, pas besoin du service Gmail
+        if mode == "draft":
+            draft_id = save_draft_to_firestore(to, subject, message)
+            debug("DRAFT SAVED", {"draft_id": draft_id})
+            return jsonify(
+                {"status": "ok", "mode": "draft", "draft_id": draft_id}
+            ), 200
+        
+        # Mode send: on a besoin du service Gmail
         debug("GETTING GMAIL SERVICE")
         service = get_gmail_service()
         debug("GMAIL SERVICE READY")
@@ -353,6 +383,86 @@ def root():
         return jsonify(
             {"status": "ok", "mode": mode, "id": email_id, "pixel_id": pixel_id}
         ), 200
+
+    except Exception as e:
+        debug("UNCAUGHT ERROR", {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/send-draft", methods=["POST"])
+def send_draft():
+    """
+    Endpoint pour récupérer un draft Firestore et l'envoyer.
+
+    Attend un JSON du type:
+    {
+      "draft_id": "uuid-du-draft"
+    }
+
+    Récupère le draft dans Firestore, l'envoie avec le pixel de tracking,
+    et met à jour le statut dans Firestore.
+
+    Réponse:
+    {
+      "status": "ok",
+      "message_id": "..." (ID du message Gmail envoyé),
+      "pixel_id": "..." (ID du pixel de tracking)
+    }
+    """
+    debug("SEND DRAFT REQUEST RECEIVED")
+
+    try:
+        data = request.get_json(silent=True) or {}
+        debug("REQUEST JSON", data)
+
+        draft_id = data.get("draft_id")
+        if not draft_id:
+            return jsonify({"status": "error", "error": "draft_id is required"}), 400
+
+        # Récupérer le draft depuis Firestore
+        doc_ref = db.collection(DRAFT_COLLECTION).document(draft_id)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            return jsonify({"status": "error", "error": "Draft not found"}), 404
+        
+        draft_data = doc.to_dict()
+        debug("DRAFT DATA RETRIEVED", draft_data)
+        
+        # Vérifier le statut
+        if draft_data.get("status") == "sent":
+            return jsonify({"status": "error", "error": "Draft already sent"}), 400
+        
+        to = draft_data.get("to")
+        subject = draft_data.get("subject")
+        body = draft_data.get("body")
+        
+        # Obtenir le service Gmail
+        debug("GETTING GMAIL SERVICE")
+        service = get_gmail_service()
+        debug("GMAIL SERVICE READY")
+        
+        # Envoyer l'email avec le pixel de tracking
+        message_id, pixel_id = create_or_send_email(service, to, subject, body, mode="send")
+        
+        # Mettre à jour le statut dans Firestore
+        doc_ref.update({
+            "status": "sent",
+            "sent_at": now_utc(),
+            "message_id": message_id,
+            "pixel_id": pixel_id,
+        })
+        
+        debug("DRAFT SENT", {"message_id": message_id, "pixel_id": pixel_id})
+        
+        return jsonify({
+            "status": "ok",
+            "message_id": message_id,
+            "pixel_id": pixel_id,
+        }), 200
 
     except Exception as e:
         debug("UNCAUGHT ERROR", {
