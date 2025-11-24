@@ -30,6 +30,9 @@ SA_EMAIL = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL")
 # Exemple: https://email-open-tracker-xxxx.a.run.app
 PIXEL_TRACKER_BASE_URL = os.environ.get("PIXEL_TRACKER_BASE_URL", "").rstrip("/")
 
+# Auto-followup service URL
+AUTO_FOLLOWUP_URL = os.environ.get("AUTO_FOLLOWUP_URL", "").rstrip("/")
+
 # Nom de la collection Firestore pour les ouvertures
 PIXEL_COLLECTION = os.environ.get("PIXEL_COLLECTION", "email_opens")
 
@@ -39,6 +42,9 @@ DRAFT_COLLECTION = os.environ.get("DRAFT_COLLECTION", "email_drafts")
 # Activer/désactiver le tracking d'email
 # true = ajoute le pixel de tracking, false = pas de tracking
 ENABLE_TRACKING = os.environ.get("ENABLE_TRACKING", "false").lower() in ("true", "1", "yes")
+
+# Activer/désactiver les relances automatiques
+ENABLE_AUTO_FOLLOWUP = os.environ.get("ENABLE_AUTO_FOLLOWUP", "false").lower() in ("true", "1", "yes")
 
 # Mode d'envoi : "draft" ou "send"
 # draft = crée un brouillon
@@ -244,6 +250,10 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         mode: "draft" pour sauvegarder dans Firestore, "send" pour envoyer directement
         x_external_id: ID externe (ex: pharowCompanyId) pour tracking
         version_group_id: ID pour grouper les versions d'un même draft
+        
+    Returns:
+        Pour mode="draft": (draft_id, None, None, version_group_id)
+        Pour mode="send": (gmail_message_id, gmail_thread_id, pixel_id, version_group_id)
     """
     debug("CREATE_OR_SEND_EMAIL INPUT", {
         "to": to,
@@ -257,7 +267,7 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
     # En mode draft, on sauvegarde dans Firestore au lieu de créer un draft Gmail
     if mode == "draft":
         draft_id, version_group_id = save_draft_to_firestore(to, subject, body, x_external_id, version_group_id)
-        return draft_id, None, version_group_id
+        return draft_id, None, None, version_group_id
 
     # Générer un ID unique pour le pixel
     pixel_id = str(uuid.uuid4())
@@ -335,7 +345,14 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         body=message_body,
     ).execute()
     debug("MESSAGE SENT RESPONSE", sent)
-    return sent.get("id"), pixel_id, version_group_id
+    
+    # Récupérer le message_id et thread_id de la réponse Gmail
+    gmail_message_id = sent.get("id")
+    gmail_thread_id = sent.get("threadId")
+    
+    debug("MESSAGE IDS", {"message_id": gmail_message_id, "thread_id": gmail_thread_id})
+    
+    return gmail_message_id, gmail_thread_id, pixel_id, version_group_id
 
 
 # --- HTTP endpoint (Cloud Run) ---------------------------------------
@@ -394,11 +411,11 @@ def root():
         service = get_gmail_service()
         debug("GMAIL SERVICE READY")
 
-        email_id, pixel_id, _ = create_or_send_email(service, to, subject, message, mode, x_external_id, version_group_id)
-        debug("RESPONSE SENT", {"mode": mode, "id": email_id, "pixel_id": pixel_id})
+        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, message, mode, x_external_id, version_group_id)
+        debug("RESPONSE SENT", {"mode": mode, "gmail_message_id": gmail_message_id, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
 
         return jsonify(
-            {"status": "ok", "mode": mode, "id": email_id, "pixel_id": pixel_id}
+            {"status": "ok", "mode": mode, "id": gmail_message_id, "thread_id": gmail_thread_id, "pixel_id": pixel_id}
         ), 200
 
     except Exception as e:
@@ -463,21 +480,42 @@ def send_draft():
         debug("GMAIL SERVICE READY")
         
         # Envoyer l'email avec le pixel de tracking
-        message_id, pixel_id = create_or_send_email(service, to, subject, body, mode="send")
+        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, body, mode="send")
         
-        # Mettre à jour le statut dans Firestore
+        # Mettre à jour le statut dans Firestore avec les IDs Gmail
         doc_ref.update({
             "status": "sent",
             "sent_at": now_utc(),
-            "message_id": message_id,
+            "message_id": gmail_message_id,
+            "gmail_message_id": gmail_message_id,  # Pour la détection de réponses
+            "gmail_thread_id": gmail_thread_id,    # Pour la détection de réponses
             "pixel_id": pixel_id,
+            "has_reply": False,  # Initialiser à False
         })
         
-        debug("DRAFT SENT", {"message_id": message_id, "pixel_id": pixel_id})
+        debug("DRAFT SENT", {"gmail_message_id": gmail_message_id, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
+        
+        # Planifier les relances automatiques si activé
+        if ENABLE_AUTO_FOLLOWUP and AUTO_FOLLOWUP_URL:
+            try:
+                debug("SCHEDULING FOLLOWUPS", {"draft_id": draft_id, "auto_followup_url": AUTO_FOLLOWUP_URL})
+                followup_response = requests.post(
+                    f"{AUTO_FOLLOWUP_URL}/schedule-followups",
+                    json={"draft_id": draft_id},
+                    timeout=10
+                )
+                if followup_response.status_code == 200:
+                    followup_result = followup_response.json()
+                    debug("FOLLOWUPS SCHEDULED", followup_result)
+                else:
+                    debug("ERROR SCHEDULING FOLLOWUPS", {"status": followup_response.status_code, "response": followup_response.text})
+            except Exception as e:
+                debug("ERROR CALLING AUTO_FOLLOWUP", {"error": str(e)})
         
         return jsonify({
             "status": "ok",
-            "message_id": message_id,
+            "message_id": gmail_message_id,
+            "thread_id": gmail_thread_id,
             "pixel_id": pixel_id,
         }), 200
 
