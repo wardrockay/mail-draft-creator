@@ -204,7 +204,7 @@ def get_user_signature(service):
 
 # --- Step 3: Create Gmail Draft or Send + tracking pixel -------------
 
-def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_id=""):
+def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_id="", odoo_id=None):
     """
     Sauvegarde un draft dans Firestore pour review humain.
     
@@ -232,15 +232,19 @@ def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_i
         if x_external_id:
             draft_data["x_external_id"] = x_external_id
         
+        # Ajouter odoo_id s'il est fourni
+        if odoo_id is not None:
+            draft_data["odoo_id"] = odoo_id
+        
         doc_ref.set(draft_data)
-        debug("DRAFT SAVED TO FIRESTORE", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id})
+        debug("DRAFT SAVED TO FIRESTORE", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id})
         return draft_id, version_group_id
     except Exception as e:
         debug("ERROR SAVING DRAFT TO FIRESTORE", str(e))
         raise
 
 
-def create_or_send_email(service, to, subject, body, mode="draft", x_external_id="", version_group_id=""):
+def create_or_send_email(service, to, subject, body, mode="draft", x_external_id="", version_group_id="", odoo_id=None):
     """
     Crée un brouillon Firestore OU envoie directement l'email en HTML :
     - mode="draft": sauvegarde dans Firestore pour review humain
@@ -250,6 +254,7 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         mode: "draft" pour sauvegarder dans Firestore, "send" pour envoyer directement
         x_external_id: ID externe (ex: pharowCompanyId) pour tracking
         version_group_id: ID pour grouper les versions d'un même draft
+        odoo_id: ID du lead dans Odoo
         
     Returns:
         Pour mode="draft": (draft_id, None, None, version_group_id)
@@ -262,11 +267,12 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         "mode": mode,
         "x_external_id": x_external_id,
         "version_group_id": version_group_id,
+        "odoo_id": odoo_id,
     })
 
     # En mode draft, on sauvegarde dans Firestore au lieu de créer un draft Gmail
     if mode == "draft":
-        draft_id, version_group_id = save_draft_to_firestore(to, subject, body, x_external_id, version_group_id)
+        draft_id, version_group_id = save_draft_to_firestore(to, subject, body, x_external_id, version_group_id, odoo_id)
         return draft_id, None, None, version_group_id
 
     # Générer un ID unique pour le pixel
@@ -392,6 +398,7 @@ def root():
         message = data.get("message", "Message automatique.")
         x_external_id = data.get("x_external_id", "")
         version_group_id = data.get("version_group_id", "")  # Pour régénération
+        odoo_id = data.get("odoo_id")  # Peut être None
         
         # Mode : utilise celui du payload, sinon celui de la variable d'env
         mode = data.get("mode", SEND_MODE).lower()
@@ -400,8 +407,8 @@ def root():
 
         # En mode draft, pas besoin du service Gmail
         if mode == "draft":
-            draft_id, version_group_id = save_draft_to_firestore(to, subject, message, x_external_id, version_group_id)
-            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id})
+            draft_id, version_group_id = save_draft_to_firestore(to, subject, message, x_external_id, version_group_id, odoo_id)
+            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id})
             return jsonify(
                 {"status": "ok", "mode": "draft", "draft_id": draft_id, "version_group_id": version_group_id}
             ), 200
@@ -411,7 +418,7 @@ def root():
         service = get_gmail_service()
         debug("GMAIL SERVICE READY")
 
-        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, message, mode, x_external_id, version_group_id)
+        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, message, mode, x_external_id, version_group_id, odoo_id)
         debug("RESPONSE SENT", {"mode": mode, "gmail_message_id": gmail_message_id, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
 
         return jsonify(
