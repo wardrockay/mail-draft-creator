@@ -198,7 +198,7 @@ def get_user_signature(service):
 
 # --- Step 3: Create Gmail Draft or Send + tracking pixel -------------
 
-def save_draft_to_firestore(to, subject, body, x_external_id=""):
+def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_id=""):
     """
     Sauvegarde un draft dans Firestore pour review humain.
     
@@ -206,6 +206,10 @@ def save_draft_to_firestore(to, subject, body, x_external_id=""):
         draft_id: ID du document Firestore créé
     """
     draft_id = str(uuid.uuid4())
+    
+    # Si pas de version_group_id fourni, en créer un nouveau (première version)
+    if not version_group_id:
+        version_group_id = str(uuid.uuid4())
     
     try:
         doc_ref = db.collection(DRAFT_COLLECTION).document(draft_id)
@@ -215,6 +219,7 @@ def save_draft_to_firestore(to, subject, body, x_external_id=""):
             "body": body,
             "created_at": now_utc(),
             "status": "pending",  # pending, sent, rejected
+            "version_group_id": version_group_id,  # Groupe les versions ensemble
         }
         
         # Ajouter x_external_id s'il est fourni
@@ -222,14 +227,14 @@ def save_draft_to_firestore(to, subject, body, x_external_id=""):
             draft_data["x_external_id"] = x_external_id
         
         doc_ref.set(draft_data)
-        debug("DRAFT SAVED TO FIRESTORE", {"draft_id": draft_id, "x_external_id": x_external_id})
-        return draft_id
+        debug("DRAFT SAVED TO FIRESTORE", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id})
+        return draft_id, version_group_id
     except Exception as e:
         debug("ERROR SAVING DRAFT TO FIRESTORE", str(e))
         raise
 
 
-def create_or_send_email(service, to, subject, body, mode="draft", x_external_id=""):
+def create_or_send_email(service, to, subject, body, mode="draft", x_external_id="", version_group_id=""):
     """
     Crée un brouillon Firestore OU envoie directement l'email en HTML :
     - mode="draft": sauvegarde dans Firestore pour review humain
@@ -238,6 +243,7 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
     Args:
         mode: "draft" pour sauvegarder dans Firestore, "send" pour envoyer directement
         x_external_id: ID externe (ex: pharowCompanyId) pour tracking
+        version_group_id: ID pour grouper les versions d'un même draft
     """
     debug("CREATE_OR_SEND_EMAIL INPUT", {
         "to": to,
@@ -245,12 +251,13 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         "body_len": len(body),
         "mode": mode,
         "x_external_id": x_external_id,
+        "version_group_id": version_group_id,
     })
 
     # En mode draft, on sauvegarde dans Firestore au lieu de créer un draft Gmail
     if mode == "draft":
-        draft_id = save_draft_to_firestore(to, subject, body, x_external_id)
-        return draft_id, None
+        draft_id, version_group_id = save_draft_to_firestore(to, subject, body, x_external_id, version_group_id)
+        return draft_id, None, version_group_id
 
     # Générer un ID unique pour le pixel
     pixel_id = str(uuid.uuid4())
@@ -328,7 +335,7 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         body=message_body,
     ).execute()
     debug("MESSAGE SENT RESPONSE", sent)
-    return sent.get("id"), pixel_id
+    return sent.get("id"), pixel_id, version_group_id
 
 
 # --- HTTP endpoint (Cloud Run) ---------------------------------------
@@ -367,6 +374,7 @@ def root():
         subject = data.get("subject", "Email automatique")
         message = data.get("message", "Message automatique.")
         x_external_id = data.get("x_external_id", "")
+        version_group_id = data.get("version_group_id", "")  # Pour régénération
         
         # Mode : utilise celui du payload, sinon celui de la variable d'env
         mode = data.get("mode", SEND_MODE).lower()
@@ -375,10 +383,10 @@ def root():
 
         # En mode draft, pas besoin du service Gmail
         if mode == "draft":
-            draft_id = save_draft_to_firestore(to, subject, message, x_external_id)
-            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id})
+            draft_id, version_group_id = save_draft_to_firestore(to, subject, message, x_external_id, version_group_id)
+            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id})
             return jsonify(
-                {"status": "ok", "mode": "draft", "draft_id": draft_id}
+                {"status": "ok", "mode": "draft", "draft_id": draft_id, "version_group_id": version_group_id}
             ), 200
         
         # Mode send: on a besoin du service Gmail
@@ -386,7 +394,7 @@ def root():
         service = get_gmail_service()
         debug("GMAIL SERVICE READY")
 
-        email_id, pixel_id = create_or_send_email(service, to, subject, message, mode, x_external_id)
+        email_id, pixel_id, _ = create_or_send_email(service, to, subject, message, mode, x_external_id, version_group_id)
         debug("RESPONSE SENT", {"mode": mode, "id": email_id, "pixel_id": pixel_id})
 
         return jsonify(
