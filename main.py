@@ -9,6 +9,7 @@ from email.message import EmailMessage
 
 from flask import Flask, request, jsonify
 import requests
+import markdown
 
 import google.auth
 from google.auth.transport.requests import Request as GoogleRequest
@@ -323,8 +324,18 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
     if signature_html:
         plain_body = f"{body}\n\n-- \nSignature"
 
-    # Corps HTML : on remplace les sauts de ligne par des <br> simples
-    html_body = body.replace("\n", "<br>")
+    # Convertir le Markdown en HTML
+    # Extensions utiles : nl2br (sauts de ligne), tables, fenced_code
+    html_body = markdown.markdown(
+        body,
+        extensions=['nl2br', 'tables', 'fenced_code', 'sane_lists']
+    )
+    
+    # Ajouter du style CSS inline pour un meilleur rendu
+    # Wrap le contenu dans un div avec style de base
+    html_body = f'''<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #333;">
+{html_body}
+</div>'''
 
     # Pixel de tracking (si URL dispo)
     tracking_img = ""
@@ -462,11 +473,13 @@ def send_draft():
 
     Attend un JSON du type:
     {
-      "draft_id": "uuid-du-draft"
+      "draft_id": "uuid-du-draft",
+      "test_mode": false,  // Optionnel: si true, envoie à test_email sans changer le statut
+      "test_email": "test@exemple.fr"  // Requis si test_mode=true
     }
 
     Récupère le draft dans Firestore, l'envoie avec le pixel de tracking,
-    et met à jour le statut dans Firestore.
+    et met à jour le statut dans Firestore (sauf en mode test).
 
     Réponse:
     {
@@ -482,8 +495,15 @@ def send_draft():
         debug("REQUEST JSON", data)
 
         draft_id = data.get("draft_id")
+        test_mode = data.get("test_mode", False)
+        test_email = data.get("test_email", "")
+        
         if not draft_id:
             return jsonify({"status": "error", "error": "draft_id is required"}), 400
+        
+        # En mode test, l'adresse email de test est requise
+        if test_mode and not test_email:
+            return jsonify({"status": "error", "error": "test_email is required in test mode"}), 400
 
         # Récupérer le draft depuis Firestore
         doc_ref = db.collection(DRAFT_COLLECTION).document(draft_id)
@@ -495,13 +515,20 @@ def send_draft():
         draft_data = doc.to_dict()
         debug("DRAFT DATA RETRIEVED", draft_data)
         
-        # Vérifier le statut
-        if draft_data.get("status") == "sent":
+        # Vérifier le statut (seulement si pas en mode test)
+        if not test_mode and draft_data.get("status") == "sent":
             return jsonify({"status": "error", "error": "Draft already sent"}), 400
         
-        to = draft_data.get("to")
+        # En mode test, on utilise l'adresse de test, sinon l'adresse du prospect
+        to = test_email if test_mode else draft_data.get("to")
         subject = draft_data.get("subject")
         body = draft_data.get("body")
+        
+        # En mode test, on ajoute un préfixe au sujet
+        if test_mode:
+            subject = f"[TEST] {subject}"
+        
+        debug("SENDING TO", {"to": to, "test_mode": test_mode})
         
         # Obtenir le service Gmail
         debug("GETTING GMAIL SERVICE")
@@ -511,41 +538,46 @@ def send_draft():
         # Envoyer l'email avec le pixel de tracking
         gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, body, mode="send")
         
-        # Mettre à jour le statut dans Firestore avec les IDs Gmail
-        doc_ref.update({
-            "status": "sent",
-            "sent_at": now_utc(),
-            "message_id": gmail_message_id,
-            "gmail_message_id": gmail_message_id,  # Pour la détection de réponses
-            "gmail_thread_id": gmail_thread_id,    # Pour la détection de réponses
-            "pixel_id": pixel_id,
-            "has_reply": False,  # Initialiser à False
-        })
-        
-        debug("DRAFT SENT", {"gmail_message_id": gmail_message_id, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
-        
-        # Planifier les relances automatiques si activé
-        if ENABLE_AUTO_FOLLOWUP and AUTO_FOLLOWUP_URL:
-            try:
-                debug("SCHEDULING FOLLOWUPS", {"draft_id": draft_id, "auto_followup_url": AUTO_FOLLOWUP_URL})
-                followup_response = requests.post(
-                    f"{AUTO_FOLLOWUP_URL}/schedule-followups",
-                    json={"draft_id": draft_id},
-                    timeout=10
-                )
-                if followup_response.status_code == 200:
-                    followup_result = followup_response.json()
-                    debug("FOLLOWUPS SCHEDULED", followup_result)
-                else:
-                    debug("ERROR SCHEDULING FOLLOWUPS", {"status": followup_response.status_code, "response": followup_response.text})
-            except Exception as e:
-                debug("ERROR CALLING AUTO_FOLLOWUP", {"error": str(e)})
+        # En mode test, on ne met pas à jour le statut du draft
+        if not test_mode:
+            # Mettre à jour le statut dans Firestore avec les IDs Gmail
+            doc_ref.update({
+                "status": "sent",
+                "sent_at": now_utc(),
+                "message_id": gmail_message_id,
+                "gmail_message_id": gmail_message_id,  # Pour la détection de réponses
+                "gmail_thread_id": gmail_thread_id,    # Pour la détection de réponses
+                "pixel_id": pixel_id,
+                "has_reply": False,  # Initialiser à False
+            })
+            
+            debug("DRAFT SENT", {"gmail_message_id": gmail_message_id, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
+            
+            # Planifier les relances automatiques si activé
+            if ENABLE_AUTO_FOLLOWUP and AUTO_FOLLOWUP_URL:
+                try:
+                    debug("SCHEDULING FOLLOWUPS", {"draft_id": draft_id, "auto_followup_url": AUTO_FOLLOWUP_URL})
+                    followup_response = requests.post(
+                        f"{AUTO_FOLLOWUP_URL}/schedule-followups",
+                        json={"draft_id": draft_id},
+                        timeout=10
+                    )
+                    if followup_response.status_code == 200:
+                        followup_result = followup_response.json()
+                        debug("FOLLOWUPS SCHEDULED", followup_result)
+                    else:
+                        debug("ERROR SCHEDULING FOLLOWUPS", {"status": followup_response.status_code, "response": followup_response.text})
+                except Exception as e:
+                    debug("ERROR CALLING AUTO_FOLLOWUP", {"error": str(e)})
+        else:
+            debug("TEST EMAIL SENT (draft status not updated)", {"to": test_email, "gmail_message_id": gmail_message_id})
         
         return jsonify({
             "status": "ok",
             "message_id": gmail_message_id,
             "thread_id": gmail_thread_id,
             "pixel_id": pixel_id,
+            "test_mode": test_mode,
         }), 200
 
     except Exception as e:

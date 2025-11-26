@@ -5,4 +5,5 @@ google-api-python-client==2.*
 google-cloud-firestore==2.*
 flask==3.*
 requests==2.31.0
+markdown==3.*
 
