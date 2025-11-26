@@ -6,4 +6,7 @@ google-cloud-firestore==2.*
 flask==3.*
 requests==2.31.0
 markdown==3.*
+pydantic[email]>=2.5.0
+pydantic-settings>=2.1.0
+gunicorn>=21.0.0
 
