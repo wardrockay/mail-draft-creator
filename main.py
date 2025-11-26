@@ -586,3 +586,103 @@ def send_draft():
             "traceback": traceback.format_exc(),
         })
         return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/resend-to-another", methods=["POST"])
+def resend_to_another():
+    """
+    Endpoint pour renvoyer un mail déjà envoyé à une autre adresse.
+    Utile quand un prospect redirige vers un collègue.
+
+    Attend un JSON du type:
+    {
+      "draft_id": "uuid-du-draft",
+      "new_email": "collegue@entreprise.com"
+    }
+
+    Réponse:
+    {
+      "status": "ok",
+      "message_id": "..." (ID du nouveau message Gmail),
+      "pixel_id": "..." (ID du nouveau pixel de tracking)
+    }
+    """
+    debug("RESEND TO ANOTHER REQUEST RECEIVED")
+
+    try:
+        data = request.get_json(silent=True) or {}
+        debug("REQUEST JSON", data)
+
+        draft_id = data.get("draft_id")
+        new_email = data.get("new_email", "").strip()
+        
+        if not draft_id:
+            return jsonify({"status": "error", "error": "draft_id is required"}), 400
+        
+        if not new_email:
+            return jsonify({"status": "error", "error": "new_email is required"}), 400
+
+        # Récupérer le draft depuis Firestore
+        doc_ref = db.collection(DRAFT_COLLECTION).document(draft_id)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            return jsonify({"status": "error", "error": "Draft not found"}), 404
+        
+        draft_data = doc.to_dict()
+        debug("DRAFT DATA RETRIEVED", draft_data)
+        
+        # Ce draft doit avoir été envoyé
+        if draft_data.get("status") != "sent":
+            return jsonify({"status": "error", "error": "Draft has not been sent yet"}), 400
+        
+        subject = draft_data.get("subject")
+        body = draft_data.get("body")
+        original_to = draft_data.get("to")
+        
+        debug("RESENDING TO NEW EMAIL", {"original_to": original_to, "new_email": new_email})
+        
+        # Obtenir le service Gmail
+        debug("GETTING GMAIL SERVICE")
+        service = get_gmail_service()
+        debug("GMAIL SERVICE READY")
+        
+        # Envoyer l'email à la nouvelle adresse (avec un nouveau pixel de tracking)
+        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, new_email, subject, body, mode="send")
+        
+        # Enregistrer le renvoi dans le draft original
+        resends = draft_data.get("resends", [])
+        resends.append({
+            "to": new_email,
+            "sent_at": now_utc().isoformat(),
+            "gmail_message_id": gmail_message_id,
+            "gmail_thread_id": gmail_thread_id,
+            "pixel_id": pixel_id
+        })
+        
+        doc_ref.update({
+            "resends": resends,
+            "last_resend_at": now_utc()
+        })
+        
+        debug("RESEND COMPLETED", {
+            "new_email": new_email,
+            "gmail_message_id": gmail_message_id,
+            "gmail_thread_id": gmail_thread_id,
+            "pixel_id": pixel_id
+        })
+        
+        return jsonify({
+            "status": "ok",
+            "message_id": gmail_message_id,
+            "thread_id": gmail_thread_id,
+            "pixel_id": pixel_id,
+            "resent_to": new_email,
+        }), 200
+
+    except Exception as e:
+        debug("UNCAUGHT ERROR", {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })
+        return jsonify({"status": "error", "error": str(e)}), 500
