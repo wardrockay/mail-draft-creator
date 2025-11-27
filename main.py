@@ -205,13 +205,15 @@ def get_user_signature(service):
 
 # --- Step 3: Create Gmail Draft or Send + tracking pixel -------------
 
-def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_id="", odoo_id=None, contact_info=None):
+def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_id="", odoo_id=None, contact_info=None, status="pending", error_message=None):
     """
     Sauvegarde un draft dans Firestore pour review humain.
     
     Args:
         contact_info: dict optionnel avec {contact_name, partner_name, function, website, description}
                      (optionnel - peut être récupéré depuis Odoo via x_external_id)
+        status: statut du draft (pending, sent, rejected, error)
+        error_message: message d'erreur si status="error"
         
     Returns:
         draft_id: ID du document Firestore créé
@@ -229,9 +231,13 @@ def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_i
             "subject": subject,
             "body": body,
             "created_at": now_utc(),
-            "status": "pending",  # pending, sent, rejected
+            "status": status,  # pending, sent, rejected, error
             "version_group_id": version_group_id,  # Groupe les versions ensemble
         }
+        
+        # Ajouter le message d'erreur si fourni
+        if error_message:
+            draft_data["error_message"] = error_message
         
         # Ajouter x_external_id s'il est fourni (important pour récupérer depuis Odoo)
         if x_external_id:
@@ -433,6 +439,10 @@ def root():
             "description": data.get("description", "")
         }
         
+        # Status et message d'erreur (pour les drafts en erreur)
+        status = data.get("status", "pending")
+        error_message = data.get("error_message")
+        
         # Mode : utilise celui du payload, sinon celui de la variable d'env
         mode = data.get("mode", SEND_MODE).lower()
         if mode not in ["draft", "send"]:
@@ -440,8 +450,11 @@ def root():
 
         # En mode draft, pas besoin du service Gmail
         if mode == "draft":
-            draft_id, version_group_id = save_draft_to_firestore(to, subject, message, x_external_id, version_group_id, odoo_id, contact_info)
-            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id})
+            draft_id, version_group_id = save_draft_to_firestore(
+                to, subject, message, x_external_id, version_group_id, 
+                odoo_id, contact_info, status, error_message
+            )
+            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id, "status": status})
             return jsonify(
                 {"status": "ok", "mode": "draft", "draft_id": draft_id, "version_group_id": version_group_id}
             ), 200
