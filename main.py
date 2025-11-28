@@ -205,7 +205,7 @@ def get_user_signature(service):
 
 # --- Step 3: Create Gmail Draft or Send + tracking pixel -------------
 
-def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_id="", odoo_id=None, contact_info=None, status="pending", error_message=None):
+def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_id="", odoo_id=None, contact_info=None, status="pending", error_message=None, reply_to_thread_id="", reply_to_message_id="", original_subject="", followup_number=0):
     """
     Sauvegarde un draft dans Firestore pour review humain.
     
@@ -214,6 +214,10 @@ def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_i
                      (optionnel - peut être récupéré depuis Odoo via x_external_id)
         status: statut du draft (pending, sent, rejected, error)
         error_message: message d'erreur si status="error"
+        reply_to_thread_id: ID du thread Gmail pour répondre dans le même thread
+        reply_to_message_id: ID du message Gmail original
+        original_subject: Sujet original pour le préfixe Re:
+        followup_number: Numéro de relance (1, 2, 3, 4)
         
     Returns:
         draft_id: ID du document Firestore créé
@@ -247,6 +251,17 @@ def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_i
         if odoo_id is not None:
             draft_data["odoo_id"] = odoo_id
         
+        # Ajouter les infos du thread Gmail pour les relances
+        if reply_to_thread_id:
+            draft_data["reply_to_thread_id"] = reply_to_thread_id
+        if reply_to_message_id:
+            draft_data["reply_to_message_id"] = reply_to_message_id
+        if original_subject:
+            draft_data["original_subject"] = original_subject
+        if followup_number > 0:
+            draft_data["followup_number"] = followup_number
+            draft_data["is_followup"] = True
+        
         # Ajouter les infos du contact pour les relances futures (optionnel, backup)
         # Les infos sont maintenant récupérées depuis Odoo via x_external_id lors des relances
         if contact_info:
@@ -255,14 +270,14 @@ def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_i
                     draft_data[key] = value
         
         doc_ref.set(draft_data)
-        debug("DRAFT SAVED TO FIRESTORE", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id})
+        debug("DRAFT SAVED TO FIRESTORE", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id, "is_followup": followup_number > 0, "reply_to_thread_id": reply_to_thread_id})
         return draft_id, version_group_id
     except Exception as e:
         debug("ERROR SAVING DRAFT TO FIRESTORE", str(e))
         raise
 
 
-def create_or_send_email(service, to, subject, body, mode="draft", x_external_id="", version_group_id="", odoo_id=None, contact_info=None):
+def create_or_send_email(service, to, subject, body, mode="draft", x_external_id="", version_group_id="", odoo_id=None, contact_info=None, reply_to_thread_id=None, reply_to_message_id=None):
     """
     Crée un brouillon Firestore OU envoie directement l'email en HTML :
     - mode="draft": sauvegarde dans Firestore pour review humain
@@ -274,6 +289,8 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         version_group_id: ID pour grouper les versions d'un même draft
         odoo_id: ID du lead dans Odoo
         contact_info: dict optionnel (les infos sont récupérées depuis Odoo via x_external_id lors des relances)
+        reply_to_thread_id: ID du thread Gmail pour envoyer en réponse (pour les relances)
+        reply_to_message_id: ID du message Gmail original pour le header References (pour les relances)
         
     Returns:
         Pour mode="draft": (draft_id, None, None, version_group_id)
@@ -288,6 +305,8 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         "version_group_id": version_group_id,
         "odoo_id": odoo_id,
         "contact_info": contact_info,
+        "reply_to_thread_id": reply_to_thread_id,
+        "reply_to_message_id": reply_to_message_id,
     })
 
     # En mode draft, on sauvegarde dans Firestore au lieu de créer un draft Gmail
@@ -362,6 +381,12 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
     msg = EmailMessage()
     msg["To"] = to
     msg["Subject"] = subject
+    
+    # Si c'est une réponse dans un thread, ajouter les headers de référence
+    if reply_to_message_id:
+        # Format: <message_id@mail.gmail.com>
+        msg["In-Reply-To"] = f"<{reply_to_message_id}@mail.gmail.com>"
+        msg["References"] = f"<{reply_to_message_id}@mail.gmail.com>"
 
     # Partie texte (fallback)
     msg.set_content(plain_body)
@@ -376,6 +401,12 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
 
     # Mode send: envoi direct du message
     message_body = {"raw": encoded}
+    
+    # Si c'est une réponse, ajouter le threadId pour que le mail apparaisse dans le thread Gmail
+    if reply_to_thread_id:
+        message_body["threadId"] = reply_to_thread_id
+        debug("SENDING AS REPLY TO THREAD", {"thread_id": reply_to_thread_id})
+    
     sent = service.users().messages().send(
         userId="me",
         body=message_body,
@@ -443,6 +474,12 @@ def root():
         status = data.get("status", "pending")
         error_message = data.get("error_message")
         
+        # Thread info pour les relances (envoyer en réponse au mail initial)
+        reply_to_thread_id = data.get("reply_to_thread_id", "")
+        reply_to_message_id = data.get("reply_to_message_id", "")
+        original_subject = data.get("original_subject", "")
+        followup_number = data.get("followup_number", 0)
+        
         # Mode : utilise celui du payload, sinon celui de la variable d'env
         mode = data.get("mode", SEND_MODE).lower()
         if mode not in ["draft", "send"]:
@@ -452,9 +489,10 @@ def root():
         if mode == "draft":
             draft_id, version_group_id = save_draft_to_firestore(
                 to, subject, message, x_external_id, version_group_id, 
-                odoo_id, contact_info, status, error_message
+                odoo_id, contact_info, status, error_message,
+                reply_to_thread_id, reply_to_message_id, original_subject, followup_number
             )
-            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id, "status": status})
+            debug("DRAFT SAVED", {"draft_id": draft_id, "x_external_id": x_external_id, "version_group_id": version_group_id, "odoo_id": odoo_id, "status": status, "is_followup": followup_number > 0})
             return jsonify(
                 {"status": "ok", "mode": "draft", "draft_id": draft_id, "version_group_id": version_group_id}
             ), 200
@@ -537,6 +575,17 @@ def send_draft():
         subject = draft_data.get("subject")
         body = draft_data.get("body")
         
+        # Récupérer les infos de thread pour les relances (envoyer en réponse)
+        reply_to_thread_id = draft_data.get("reply_to_thread_id")
+        reply_to_message_id = draft_data.get("reply_to_message_id")
+        is_followup = draft_data.get("is_followup", False)
+        
+        debug("THREAD INFO", {
+            "reply_to_thread_id": reply_to_thread_id,
+            "reply_to_message_id": reply_to_message_id,
+            "is_followup": is_followup
+        })
+        
         # En mode test, on ajoute un préfixe au sujet
         if test_mode:
             subject = f"[TEST] {subject}"
@@ -548,8 +597,12 @@ def send_draft():
         service = get_gmail_service()
         debug("GMAIL SERVICE READY")
         
-        # Envoyer l'email avec le pixel de tracking
-        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, body, mode="send")
+        # Envoyer l'email avec le pixel de tracking (et dans le thread si c'est une relance)
+        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(
+            service, to, subject, body, mode="send",
+            reply_to_thread_id=reply_to_thread_id,
+            reply_to_message_id=reply_to_message_id
+        )
         
         # En mode test, on ne met pas à jour le statut du draft
         if not test_mode:
