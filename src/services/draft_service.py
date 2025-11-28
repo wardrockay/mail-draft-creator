@@ -160,33 +160,50 @@ class DraftService:
                 field="recipient_email"
             )
         
-        # Get sender info
-        sender_email = draft_data.get("sender_email") or draft_data.get("from_address")
+        # Get sender info - use default from settings if not provided
+        settings = get_settings()
+        sender_email = draft_data.get("sender_email") or draft_data.get("from_address") or settings.gmail.delegated_user
         sender_name = draft_data.get("sender_name") or draft_data.get("from_name", "")
-        
-        if not sender_email:
-            raise ValidationError(
-                message="No sender email found in draft",
-                field="sender_email"
-            )
         
         # Prepare content
         subject = draft_data.get("subject", "")
         body = draft_data.get("body") or draft_data.get("content", "")
+        
+        # Get thread info for followups (to send as reply)
+        reply_to_thread_id = draft_data.get("reply_to_thread_id")
+        reply_to_message_id = draft_data.get("reply_to_message_id")
+        
+        # Build In-Reply-To and References headers if this is a reply
+        in_reply_to = None
+        references = None
+        if reply_to_message_id:
+            in_reply_to = f"<{reply_to_message_id}@mail.gmail.com>"
+            references = f"<{reply_to_message_id}@mail.gmail.com>"
+        
+        logger.info(
+            "Thread info for send_draft",
+            draft_id=draft_id,
+            reply_to_thread_id=reply_to_thread_id,
+            reply_to_message_id=reply_to_message_id,
+            is_followup=draft_data.get("is_followup", False)
+        )
         
         # Convert to HTML and add tracking
         html_body = self._markdown_to_html(body)
         if not test_mode:
             html_body = self._add_tracking_pixel(html_body, draft_id)
         
-        # Send email
+        # Send email (with thread info if it's a followup)
         gmail_service = self._get_gmail_service(sender_email)
         result = gmail_service.send_email(
             to_email=recipient_email,
             to_name=recipient_name,
             from_name=sender_name,
             subject=subject,
-            html_body=html_body
+            html_body=html_body,
+            thread_id=reply_to_thread_id,
+            in_reply_to=in_reply_to,
+            references=references
         )
         
         # Update draft status (only if not test mode)
@@ -211,118 +228,6 @@ class DraftService:
             "thread_id": result["thread_id"],
             "recipient": recipient_email,
             "draft_id": draft_id
-        }
-    
-    @log_execution_time()
-    def send_followup(
-        self,
-        followup_id: str,
-        test_mode: bool = False,
-        test_email: Optional[str] = None
-    ) -> dict[str, Any]:
-        """
-        Send a followup email in the same thread.
-        
-        Args:
-            followup_id: Firestore document ID of the followup.
-            test_mode: If True, sends to test_email.
-            test_email: Email address for test mode.
-            
-        Returns:
-            Dictionary with message_id, thread_id, and recipient.
-        """
-        logger.info(
-            "Sending followup",
-            followup_id=followup_id,
-            test_mode=test_mode
-        )
-        
-        if test_mode and not test_email:
-            raise ValidationError(
-                message="test_email is required when test_mode is True",
-                field="test_email"
-            )
-        
-        # Get followup data
-        followup_data = self._repository.get_followup_raw(followup_id)
-        
-        # Get original draft for thread info
-        original_draft_id = followup_data.get("original_draft_id")
-        if original_draft_id:
-            original_draft = self._repository.get_draft_raw(original_draft_id)
-            thread_id = original_draft.get("thread_id")
-            message_id_for_reply = original_draft.get("message_id")
-        else:
-            thread_id = None
-            message_id_for_reply = None
-        
-        # Determine recipient
-        if test_mode:
-            recipient_email = test_email
-            recipient_name = "Test Recipient"
-        else:
-            recipient_email = followup_data.get("recipient_email") or followup_data.get("to_address")
-            recipient_name = followup_data.get("recipient_name") or followup_data.get("to_name", "")
-        
-        # Get sender info
-        sender_email = followup_data.get("sender_email") or followup_data.get("from_address")
-        sender_name = followup_data.get("sender_name") or followup_data.get("from_name", "")
-        
-        # Prepare content
-        subject = followup_data.get("subject", "")
-        body = followup_data.get("body") or followup_data.get("content", "")
-        
-        # Convert to HTML and add tracking
-        html_body = self._markdown_to_html(body)
-        if not test_mode:
-            html_body = self._add_tracking_pixel(html_body, followup_id, is_followup=True)
-        
-        # Prepare threading headers
-        references = None
-        in_reply_to = None
-        if message_id_for_reply and not test_mode:
-            gmail_service = self._get_gmail_service(sender_email)
-            headers = gmail_service.get_message_headers(message_id_for_reply)
-            original_message_id_header = headers.get("message-id", "")
-            if original_message_id_header:
-                references = original_message_id_header
-                in_reply_to = original_message_id_header
-        
-        # Send email
-        gmail_service = self._get_gmail_service(sender_email)
-        result = gmail_service.send_email(
-            to_email=recipient_email,
-            to_name=recipient_name,
-            from_name=sender_name,
-            subject=subject,
-            html_body=html_body,
-            thread_id=thread_id if not test_mode else None,
-            references=references,
-            in_reply_to=in_reply_to
-        )
-        
-        # Update followup status
-        if not test_mode:
-            self._repository.mark_followup_sent(
-                followup_id=followup_id,
-                message_id=result["message_id"],
-                thread_id=result["thread_id"]
-            )
-        
-        logger.info(
-            "Followup sent successfully",
-            followup_id=followup_id,
-            message_id=result["message_id"],
-            thread_id=result["thread_id"],
-            test_mode=test_mode
-        )
-        
-        return {
-            "success": True,
-            "message_id": result["message_id"],
-            "thread_id": result["thread_id"],
-            "recipient": recipient_email,
-            "followup_id": followup_id
         }
     
     @log_execution_time()
@@ -355,8 +260,9 @@ class DraftService:
         # Get original draft
         draft_data = self._repository.get_draft_raw(draft_id)
         
-        # Get sender info
-        sender_email = draft_data.get("sender_email") or draft_data.get("from_address")
+        # Get sender info - use default from settings if not provided
+        settings = get_settings()
+        sender_email = draft_data.get("sender_email") or draft_data.get("from_address") or settings.gmail.delegated_user
         sender_name = draft_data.get("sender_name") or draft_data.get("from_name", "")
         
         # Prepare content

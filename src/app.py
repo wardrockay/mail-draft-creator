@@ -26,7 +26,6 @@ from src.logging_config import get_logger, set_request_id
 from src.models import (
     ResendToAnotherRequest,
     SendDraftRequest,
-    SendFollowupRequest,
 )
 from src.services import get_draft_service
 
@@ -175,6 +174,112 @@ def register_routes(app: Flask) -> None:
             "version": "2.0.0"
         }), 200
     
+    @app.route("/", methods=["POST"])
+    def create_draft() -> tuple[Response, int]:
+        """
+        Create a new draft in Firestore.
+        
+        This is the main endpoint called by mail-writer to save generated emails.
+        
+        Request body:
+            - to: Recipient email
+            - subject: Email subject
+            - message: Email body (markdown)
+            - x_external_id: External ID (Pharow)
+            - version_group_id: (optional) Group ID for draft versions
+            - odoo_id: (optional) Odoo lead ID
+            - contact_name, partner_name, function, website, description: Contact info
+            - status: (optional) Draft status, default "pending"
+            - error_message: (optional) Error message if status="error"
+            - reply_to_thread_id, reply_to_message_id, original_subject: Thread info for followups
+            - followup_number: (optional) Followup number (1-4)
+        
+        Returns:
+            JSON response with draft_id and version_group_id.
+        """
+        import uuid
+        from datetime import datetime, timezone
+        from google.cloud import firestore
+        
+        data = request.get_json(force=True)
+        
+        # Extract data
+        to = data.get("to", "")
+        subject = data.get("subject", "")
+        message = data.get("message", "")
+        x_external_id = data.get("x_external_id", "")
+        version_group_id = data.get("version_group_id", "") or str(uuid.uuid4())
+        odoo_id = data.get("odoo_id")
+        status = data.get("status", "pending")
+        error_message = data.get("error_message")
+        
+        # Thread info for followups
+        reply_to_thread_id = data.get("reply_to_thread_id", "")
+        reply_to_message_id = data.get("reply_to_message_id", "")
+        original_subject = data.get("original_subject", "")
+        followup_number = data.get("followup_number", 0)
+        
+        # Contact info
+        contact_info = {
+            "contact_name": data.get("contact_name", ""),
+            "partner_name": data.get("partner_name", ""),
+            "function": data.get("function", ""),
+            "website": data.get("website", ""),
+            "description": data.get("description", "")
+        }
+        
+        # Build draft data
+        draft_id = str(uuid.uuid4())
+        draft_data = {
+            "to": to,
+            "subject": subject,
+            "body": message,
+            "created_at": datetime.now(timezone.utc),
+            "status": status,
+            "version_group_id": version_group_id,
+        }
+        
+        if x_external_id:
+            draft_data["x_external_id"] = x_external_id
+        if odoo_id is not None:
+            draft_data["odoo_id"] = odoo_id
+        if error_message:
+            draft_data["error_message"] = error_message
+        if reply_to_thread_id:
+            draft_data["reply_to_thread_id"] = reply_to_thread_id
+        if reply_to_message_id:
+            draft_data["reply_to_message_id"] = reply_to_message_id
+        if original_subject:
+            draft_data["original_subject"] = original_subject
+        if followup_number > 0:
+            draft_data["followup_number"] = followup_number
+            draft_data["is_followup"] = True
+        
+        # Add contact info
+        for key, value in contact_info.items():
+            if value:
+                draft_data[key] = value
+        
+        # Save to Firestore
+        db = firestore.Client()
+        settings = get_settings()
+        doc_ref = db.collection(settings.firestore.drafts_collection).document(draft_id)
+        doc_ref.set(draft_data)
+        
+        logger.info(
+            "✅ Draft saved to Firestore",
+            draft_id=draft_id,
+            version_group_id=version_group_id,
+            is_followup=followup_number > 0
+        )
+        
+        return jsonify({
+            "status": "ok",
+            "mode": "draft",
+            "draft_id": draft_id,
+            "version_group_id": version_group_id
+        }), 200
+    
     @app.route("/send-draft", methods=["POST"])
     def send_draft() -> tuple[Response, int]:
         """
@@ -197,34 +302,6 @@ def register_routes(app: Flask) -> None:
         service = get_draft_service()
         result = service.send_draft(
             draft_id=req.draft_id,
-            test_mode=req.test_mode,
-            test_email=req.test_email
-        )
-        
-        return jsonify(result), 200
-    
-    @app.route("/send-followup", methods=["POST"])
-    def send_followup() -> tuple[Response, int]:
-        """
-        Send a followup email.
-        
-        Request body:
-            - followup_id: Firestore document ID
-            - test_mode: (optional) If true, send to test_email
-            - test_email: (optional) Email for test mode
-        
-        Returns:
-            JSON response with message_id and thread_id.
-        """
-        data = request.get_json(force=True)
-        
-        # Validate request
-        req = SendFollowupRequest(**data)
-        
-        # Get service and send
-        service = get_draft_service()
-        result = service.send_followup(
-            followup_id=req.followup_id,
             test_mode=req.test_mode,
             test_email=req.test_email
         )

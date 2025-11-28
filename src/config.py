@@ -33,7 +33,8 @@ class GmailSettings(BaseSettings):
     )
     
     delegated_user: str = Field(
-        ...,
+        default="",
+        alias="GMAIL_USER",
         description="Email address for domain-wide delegation"
     )
     scopes: list[str] = Field(
