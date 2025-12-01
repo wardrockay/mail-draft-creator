@@ -195,8 +195,10 @@ class FirestoreRepository:
         """
         self.update_draft(draft_id, {
             "status": DraftStatus.SENT.value,
-            "message_id": message_id,
-            "thread_id": thread_id,
+            "gmail_message_id": message_id,
+            "gmail_thread_id": thread_id,
+            "message_id": message_id,  # Keep for backward compatibility
+            "thread_id": thread_id,    # Keep for backward compatibility
             "sent_at": sent_at or datetime.utcnow(),
         })
     
@@ -226,6 +228,88 @@ class FirestoreRepository:
             raise FirestoreError(
                 message=f"Failed to create draft: {e}",
                 context=ErrorContext(operation="create_draft"),
+                cause=e
+            )
+    
+    def migrate_message_id_fields(self, limit: Optional[int] = None) -> dict[str, Any]:
+        """
+        Migrate drafts from message_id/thread_id to gmail_message_id/gmail_thread_id.
+        
+        Args:
+            limit: Maximum number of drafts to migrate (None = all).
+            
+        Returns:
+            Dictionary with migration results.
+        """
+        try:
+            migrated_count = 0
+            skipped_count = 0
+            error_count = 0
+            
+            query = self._client.collection(self._drafts_collection)
+            
+            if limit:
+                query = query.limit(limit)
+            
+            for doc in query.stream():
+                try:
+                    data = doc.to_dict()
+                    
+                    # Check if migration is needed
+                    has_old_fields = "message_id" in data or "thread_id" in data
+                    has_new_fields = "gmail_message_id" in data and "gmail_thread_id" in data
+                    
+                    if not has_old_fields or has_new_fields:
+                        skipped_count += 1
+                        continue
+                    
+                    # Migrate fields
+                    update_data = {}
+                    
+                    if "message_id" in data and data["message_id"]:
+                        update_data["gmail_message_id"] = data["message_id"]
+                    
+                    if "thread_id" in data and data["thread_id"]:
+                        update_data["gmail_thread_id"] = data["thread_id"]
+                    
+                    if update_data:
+                        doc.reference.update(update_data)
+                        migrated_count += 1
+                        logger.info(
+                            "Migrated draft fields",
+                            draft_id=doc.id,
+                            fields=list(update_data.keys())
+                        )
+                    else:
+                        skipped_count += 1
+                        
+                except Exception as e:
+                    error_count += 1
+                    logger.error(
+                        "Failed to migrate draft",
+                        draft_id=doc.id,
+                        error=str(e)
+                    )
+            
+            logger.info(
+                "Migration complete",
+                migrated=migrated_count,
+                skipped=skipped_count,
+                errors=error_count
+            )
+            
+            return {
+                "migrated_count": migrated_count,
+                "skipped_count": skipped_count,
+                "error_count": error_count,
+                "total_processed": migrated_count + skipped_count + error_count
+            }
+            
+        except Exception as e:
+            logger.error("Migration failed", error=str(e))
+            raise FirestoreError(
+                message=f"Migration failed: {e}",
+                context=ErrorContext(operation="migrate_message_id_fields"),
                 cause=e
             )
     

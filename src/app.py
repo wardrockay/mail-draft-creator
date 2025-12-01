@@ -334,6 +334,28 @@ def register_routes(app: Flask) -> None:
         )
         
         return jsonify(result), 200
+    
+    @app.route("/migrate-message-ids", methods=["POST"])
+    def migrate_message_ids() -> tuple[Response, int]:
+        """
+        Migrate drafts from message_id/thread_id to gmail_message_id/gmail_thread_id.
+        
+        Request body (optional):
+            - limit: Maximum number of drafts to process
+        
+        Returns:
+            JSON response with migration results.
+        """
+        from src.repositories.firestore_repository import FirestoreRepository
+        
+        data = request.get_json(force=True) if request.data else {}
+        limit = data.get("limit")
+        
+        # Get repository and migrate
+        repo = FirestoreRepository()
+        result = repo.migrate_message_id_fields(limit=limit)
+        
+        return jsonify(result), 200
 
 
 # Create application instance
