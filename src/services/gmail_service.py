@@ -475,6 +475,41 @@ class GmailService:
         """Force refresh of the Gmail service connection."""
         self._gmail_service = None
         logger.info("Gmail service marked for refresh")
+    
+    def get_user_signature(self) -> str:
+        """
+        Retrieve the Gmail signature (HTML) for the delegated user.
+        
+        Returns:
+            HTML signature string, or empty string if not found.
+        """
+        try:
+            send_as = (
+                self.gmail.users()
+                .settings()
+                .sendAs()
+                .get(userId="me", sendAsEmail=self._delegated_user)
+                .execute()
+            )
+            
+            signature = send_as.get("signature", "")
+            
+            # Add alt="" to img tags that don't have one
+            if signature and "<img" in signature:
+                import re
+                signature = re.sub(
+                    r'<img(?![^>]*\balt\s*=)([^>]*)>',
+                    r'<img alt=""\1>',
+                    signature,
+                    flags=re.IGNORECASE
+                )
+            
+            logger.debug("Signature retrieved", signature_length=len(signature))
+            return signature
+            
+        except Exception as e:
+            logger.warning(f"Could not retrieve signature: {e}")
+            return ""
 
 
 class GmailServiceFactory:

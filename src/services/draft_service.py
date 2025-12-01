@@ -227,6 +227,14 @@ class DraftService:
         
         # Convert to HTML and add tracking
         html_body = self._markdown_to_html(body)
+        
+        # Get and append Gmail signature
+        gmail_service = self._get_gmail_service(sender_email)
+        signature_html = gmail_service.get_user_signature()
+        if signature_html:
+            html_body = f"{html_body}<br><br>{signature_html}"
+            logger.debug("Signature added to email body")
+        
         pixel_id = None
         
         if not test_mode:
@@ -239,7 +247,6 @@ class DraftService:
             )
         
         # Send email - followups are sent as new separate emails (no threading)
-        gmail_service = self._get_gmail_service(sender_email)
         result = gmail_service.send_email(
             to_email=recipient_email,
             to_name=recipient_name,

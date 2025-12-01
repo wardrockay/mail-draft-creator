@@ -49,16 +49,16 @@ class TrackingSettings(BaseSettings):
     """Email tracking configuration."""
     
     model_config = SettingsConfigDict(
-        env_prefix="TRACKING_",
         extra="ignore"
     )
     
     base_url: str = Field(
-        default="https://mail-tracker-642098175556.europe-west1.run.app",
+        default="https://mail-track.lightandshutter.fr",
+        alias="PIXEL_TRACKER_BASE_URL",
         description="Base URL for tracking pixels"
     )
     pixel_endpoint: str = Field(
-        default="/pixel.png",
+        default="/pixel",
         description="Endpoint for tracking pixel"
     )
     
@@ -109,6 +109,11 @@ class ServiceURLs(BaseSettings):
         default="https://auto-followup-642098175556.europe-west1.run.app",
         alias="AUTO_FOLLOWUP_URL",
         description="Auto-followup service URL"
+    )
+    gmail_notifier_url: str = Field(
+        default="https://gmail-notifier-642098175556.europe-west1.run.app",
+        alias="GMAIL_NOTIFIER_URL",
+        description="Gmail notifier service URL"
     )
 
 

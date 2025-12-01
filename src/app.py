@@ -356,6 +356,223 @@ def register_routes(app: Flask) -> None:
         result = repo.migrate_message_id_fields(limit=limit)
         
         return jsonify(result), 200
+    
+    @app.route("/check-all-replies", methods=["POST"])
+    def check_all_replies() -> tuple[Response, int]:
+        """
+        Check for replies to all sent drafts with gmail_thread_id.
+        
+        For each draft with a gmail_thread_id, calls gmail-notifier to check for replies
+        and updates Firestore if necessary.
+        
+        Request body (optional):
+            - limit: Maximum number of drafts to process
+        
+        Returns:
+            JSON response with check results.
+        """
+        import requests
+        from google.cloud import firestore
+        from google.auth.transport.requests import Request as GoogleRequest
+        import google.auth
+        
+        settings = get_settings()
+        db = firestore.Client()
+        
+        data = request.get_json(force=True) if request.data else {}
+        limit = data.get("limit", 100)
+        
+        # Get all sent drafts with gmail_thread_id
+        drafts_ref = db.collection(settings.firestore.drafts_collection).where(
+            "status", "==", "sent"
+        ).where(
+            "gmail_thread_id", "!=", ""
+        ).limit(limit)
+        
+        drafts = list(drafts_ref.stream())
+        
+        if not drafts:
+            return jsonify({
+                "status": "ok",
+                "message": "No drafts to check",
+                "total_checked": 0,
+                "replies_found": 0
+            }), 200
+        
+        # Get ID token for gmail-notifier
+        gmail_notifier_url = settings.services.gmail_notifier_url
+        if not gmail_notifier_url:
+            return jsonify({
+                "error": True,
+                "message": "GMAIL_NOTIFIER_URL not configured"
+            }), 500
+        
+        try:
+            credentials, project_id = google.auth.default()
+            credentials.refresh(GoogleRequest())
+            
+            if hasattr(credentials, 'id_token'):
+                id_token = credentials.id_token
+            else:
+                # Generate ID token
+                sa_email = credentials.service_account_email if hasattr(credentials, 'service_account_email') else None
+                if not sa_email:
+                    sa_email = settings.service_account_email
+                
+                url = f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{sa_email}:generateIdToken"
+                headers = {
+                    "Authorization": f"Bearer {credentials.token}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "audience": gmail_notifier_url,
+                    "includeEmail": True
+                }
+                
+                response = requests.post(url, json=payload, headers=headers, timeout=10)
+                response.raise_for_status()
+                id_token = response.json()["token"]
+        except Exception as e:
+            logger.warning(f"Could not get ID token: {e}, proceeding without auth")
+            id_token = None
+        
+        # Check each draft for replies
+        total_checked = 0
+        replies_found = 0
+        errors = []
+        
+        for doc in drafts:
+            draft_id = doc.id
+            draft_data = doc.to_dict()
+            
+            # Skip if already has a reply
+            if draft_data.get("has_reply"):
+                continue
+            
+            try:
+                headers = {"Content-Type": "application/json"}
+                if id_token:
+                    headers["Authorization"] = f"Bearer {id_token}"
+                
+                response = requests.post(
+                    f"{gmail_notifier_url}/fetch-reply",
+                    json={"draft_id": draft_id},
+                    headers=headers,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    total_checked += 1
+                    
+                    if result.get("has_reply"):
+                        replies_found += 1
+                        logger.info(f"Reply found for draft {draft_id}")
+                else:
+                    errors.append({
+                        "draft_id": draft_id,
+                        "error": f"HTTP {response.status_code}"
+                    })
+                    
+            except Exception as e:
+                errors.append({
+                    "draft_id": draft_id,
+                    "error": str(e)
+                })
+                logger.error(f"Error checking draft {draft_id}: {e}")
+        
+        return jsonify({
+            "status": "ok",
+            "total_checked": total_checked,
+            "replies_found": replies_found,
+            "errors": errors if errors else None
+        }), 200
+    
+    @app.route("/delete-draft/<draft_id>", methods=["DELETE"])
+    def delete_draft(draft_id: str) -> tuple[Response, int]:
+        """
+        Delete a draft and all related data (followups, tracking pixels, email opens).
+        
+        Path parameter:
+            - draft_id: The draft ID to delete
+        
+        Returns:
+            JSON response with deletion results.
+        """
+        from google.cloud import firestore
+        
+        settings = get_settings()
+        db = firestore.Client()
+        
+        deleted = {
+            "draft": False,
+            "followups": 0,
+            "pixel_doc": False,
+            "opens": 0
+        }
+        
+        try:
+            # 1. Get draft data first (to get pixel_id)
+            draft_ref = db.collection(settings.firestore.drafts_collection).document(draft_id)
+            draft_doc = draft_ref.get()
+            
+            if not draft_doc.exists:
+                return jsonify({
+                    "error": True,
+                    "message": f"Draft {draft_id} not found"
+                }), 404
+            
+            draft_data = draft_doc.to_dict()
+            pixel_id = draft_data.get("pixel_id")
+            
+            # 2. Delete all followups for this draft
+            followups_ref = db.collection(settings.firestore.followups_collection).where(
+                "draft_id", "==", draft_id
+            )
+            
+            for followup_doc in followups_ref.stream():
+                followup_doc.reference.delete()
+                deleted["followups"] += 1
+            
+            # 3. Delete tracking pixel document and opens subcollection if exists
+            if pixel_id:
+                pixel_ref = db.collection(settings.firestore.pixel_opens_collection).document(pixel_id)
+                pixel_doc = pixel_ref.get()
+                
+                if pixel_doc.exists:
+                    # Delete opens subcollection
+                    opens_ref = pixel_ref.collection("opens")
+                    for open_doc in opens_ref.stream():
+                        open_doc.reference.delete()
+                        deleted["opens"] += 1
+                    
+                    # Delete pixel document
+                    pixel_ref.delete()
+                    deleted["pixel_doc"] = True
+            
+            # 4. Delete the draft itself
+            draft_ref.delete()
+            deleted["draft"] = True
+            
+            logger.info(
+                "Draft and related data deleted",
+                draft_id=draft_id,
+                deleted=deleted
+            )
+            
+            return jsonify({
+                "status": "ok",
+                "message": f"Draft {draft_id} and related data deleted successfully",
+                "deleted": deleted
+            }), 200
+            
+        except Exception as e:
+            logger.error(f"Error deleting draft {draft_id}: {e}", exc_info=True)
+            return jsonify({
+                "error": True,
+                "message": f"Failed to delete draft: {str(e)}",
+                "deleted": deleted
+            }), 500
 
 
 # Create application instance
