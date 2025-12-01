@@ -84,6 +84,10 @@ class FirestoreSettings(BaseSettings):
         default="email_followups",
         description="Collection for email followups"
     )
+    pixel_opens_collection: str = Field(
+        default="email_opens",
+        description="Collection for email tracking pixels"
+    )
 
 
 class ServiceURLs(BaseSettings):

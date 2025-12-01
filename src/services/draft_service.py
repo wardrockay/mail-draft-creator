@@ -8,11 +8,13 @@ Orchestrates Gmail and Firestore operations.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any, Optional
 
 import markdown
 import requests
+from google.cloud import firestore
 
 from src.config import get_settings
 from src.exceptions import (
@@ -87,22 +89,48 @@ class DraftService:
         """
         return markdown.markdown(text, extensions=self.MARKDOWN_EXTENSIONS)
     
-    def _add_tracking_pixel(self, html: str, draft_id: str, is_followup: bool = False) -> str:
+    def _add_tracking_pixel(
+        self, 
+        html: str, 
+        draft_id: str, 
+        recipient_email: str,
+        subject: str,
+        is_followup: bool = False
+    ) -> tuple[str, str]:
         """
-        Add tracking pixel to HTML content.
+        Add tracking pixel to HTML content and create Firestore tracking document.
         
         Args:
             html: HTML content.
             draft_id: Draft or followup ID for tracking.
+            recipient_email: Email recipient.
+            subject: Email subject.
             is_followup: Whether this is a followup email.
             
         Returns:
-            HTML with tracking pixel appended.
+            Tuple of (HTML with tracking pixel, pixel_id).
         """
-        doc_type = "followup" if is_followup else "draft"
-        pixel_url = f"{self._settings.tracking.pixel_url}?id={draft_id}&type={doc_type}"
+        # Generate unique pixel ID
+        pixel_id = str(uuid.uuid4())
+        
+        # Create Firestore document for tracking
+        db = firestore.Client()
+        pixel_collection = self._settings.firestore.pixel_opens_collection
+        doc_ref = db.collection(pixel_collection).document(pixel_id)
+        doc_ref.set({
+            "to": recipient_email,
+            "subject": subject,
+            "draft_id": draft_id,
+            "open_count": 0,
+            "created_at": datetime.utcnow(),
+            "is_followup": is_followup
+        })
+        
+        # Add pixel to HTML
+        pixel_url = f"{self._settings.tracking.pixel_url}?id={pixel_id}"
         pixel_tag = f'<img src="{pixel_url}" width="1" height="1" style="display:none" alt="">'
-        return html + pixel_tag
+        
+        return html + pixel_tag, pixel_id
     
     @log_execution_time()
     def send_draft(
@@ -199,8 +227,16 @@ class DraftService:
         
         # Convert to HTML and add tracking
         html_body = self._markdown_to_html(body)
+        pixel_id = None
+        
         if not test_mode:
-            html_body = self._add_tracking_pixel(html_body, draft_id)
+            html_body, pixel_id = self._add_tracking_pixel(
+                html_body, 
+                draft_id,
+                recipient_email,
+                subject,
+                is_followup
+            )
         
         # Send email - followups are sent as new separate emails (no threading)
         gmail_service = self._get_gmail_service(sender_email)
@@ -218,6 +254,11 @@ class DraftService:
                 "message_id": result["message_id"],
                 "thread_id": result["thread_id"]
             }
+            
+            # Add pixel_id if tracking is enabled
+            if pixel_id:
+                update_data["pixel_id"] = pixel_id
+            
             # Mark followups so they don't trigger new followups
             if is_followup:
                 update_data["no_followup"] = True
@@ -227,14 +268,20 @@ class DraftService:
                 message_id=result["message_id"],
                 thread_id=result["thread_id"]
             )
-            # Update no_followup flag separately
+            # Update pixel_id and no_followup flag separately
+            extra_updates = {}
+            if pixel_id:
+                extra_updates["pixel_id"] = pixel_id
             if is_followup:
-                self._repository.update_draft(draft_id, {"no_followup": True})
+                extra_updates["no_followup"] = True
+            if extra_updates:
+                self._repository.update_draft(draft_id, extra_updates)
         
         logger.info(
             "Draft sent successfully",
             draft_id=draft_id,
             message_id=result["message_id"],
+            pixel_id=pixel_id,
             recipient=recipient_email,
             test_mode=test_mode
         )
@@ -243,13 +290,18 @@ class DraftService:
         if not test_mode and not is_followup:
             self._schedule_followups(draft_id)
         
-        return {
+        response = {
             "success": True,
             "message_id": result["message_id"],
             "thread_id": result["thread_id"],
             "recipient": recipient_email,
             "draft_id": draft_id
         }
+        
+        if pixel_id:
+            response["pixel_id"] = pixel_id
+        
+        return response
     
     def _schedule_followups(self, draft_id: str) -> None:
         """

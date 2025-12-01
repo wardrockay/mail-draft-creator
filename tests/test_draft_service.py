@@ -157,11 +157,17 @@ class TestDraftService:
     ) -> None:
         """Test tracking pixel addition."""
         html = "<p>Hello</p>"
-        result = draft_service._add_tracking_pixel(html, "draft_123")
+        result_html, pixel_id = draft_service._add_tracking_pixel(
+            html, 
+            "draft_123",
+            "test@example.com",
+            "Test Subject"
+        )
         
-        assert "pixel.png" in result
-        assert "id=draft_123" in result
-        assert "type=draft" in result
+        assert "pixel.png" in result_html
+        assert f"id={pixel_id}" in result_html
+        assert pixel_id is not None
+        assert len(pixel_id) == 36  # UUID length
     
     def test_add_tracking_pixel_for_followup(
         self,
@@ -169,10 +175,16 @@ class TestDraftService:
     ) -> None:
         """Test tracking pixel for followup emails."""
         html = "<p>Followup</p>"
-        result = draft_service._add_tracking_pixel(html, "followup_456", is_followup=True)
+        result_html, pixel_id = draft_service._add_tracking_pixel(
+            html, 
+            "followup_456",
+            "test@example.com",
+            "Followup Subject",
+            is_followup=True
+        )
         
-        assert "id=followup_456" in result
-        assert "type=followup" in result
+        assert f"id={pixel_id}" in result_html
+        assert pixel_id is not None
 
 
 class TestResendToAnother:
