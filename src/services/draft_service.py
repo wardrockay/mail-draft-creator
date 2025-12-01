@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import markdown
+import requests
 
 from src.config import get_settings
 from src.exceptions import (
@@ -145,18 +146,35 @@ class DraftService:
         # Get draft data
         draft_data = self._repository.get_draft_raw(draft_id)
         
+        logger.info(
+            "Draft data retrieved",
+            draft_id=draft_id,
+            to_field=draft_data.get("to"),
+            contact_name=draft_data.get("contact_name"),
+            subject=draft_data.get("subject", "")[:50]
+        )
+        
         # Determine recipient
         if test_mode:
             recipient_email = test_email
             recipient_name = "Test Recipient"
             logger.info("Test mode: sending to test email", test_email=test_email)
         else:
-            recipient_email = draft_data.get("recipient_email") or draft_data.get("to_address")
-            recipient_name = draft_data.get("recipient_name") or draft_data.get("to_name", "")
+            recipient_email = draft_data.get("to", "").strip()
+            recipient_name = draft_data.get("contact_name", "").strip()
         
         if not recipient_email:
             raise ValidationError(
                 message="No recipient email found in draft",
+                field="recipient_email"
+            )
+        
+        # Validate email format
+        import re
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_pattern, recipient_email):
+            raise ValidationError(
+                message=f"Invalid recipient email format: '{recipient_email}'",
                 field="recipient_email"
             )
         
@@ -169,23 +187,14 @@ class DraftService:
         subject = draft_data.get("subject", "")
         body = draft_data.get("body") or draft_data.get("content", "")
         
-        # Get thread info for followups (to send as reply)
-        reply_to_thread_id = draft_data.get("reply_to_thread_id")
-        reply_to_message_id = draft_data.get("reply_to_message_id")
-        
-        # Build In-Reply-To and References headers if this is a reply
-        in_reply_to = None
-        references = None
-        if reply_to_message_id:
-            in_reply_to = f"<{reply_to_message_id}@mail.gmail.com>"
-            references = f"<{reply_to_message_id}@mail.gmail.com>"
+        # Check if this is a followup - followups are sent as new emails (not in thread)
+        is_followup = draft_data.get("is_followup", False) or draft_data.get("followup_number", 0) > 0
         
         logger.info(
-            "Thread info for send_draft",
+            "Sending draft",
             draft_id=draft_id,
-            reply_to_thread_id=reply_to_thread_id,
-            reply_to_message_id=reply_to_message_id,
-            is_followup=draft_data.get("is_followup", False)
+            is_followup=is_followup,
+            followup_number=draft_data.get("followup_number", 0)
         )
         
         # Convert to HTML and add tracking
@@ -193,26 +202,34 @@ class DraftService:
         if not test_mode:
             html_body = self._add_tracking_pixel(html_body, draft_id)
         
-        # Send email (with thread info if it's a followup)
+        # Send email - followups are sent as new separate emails (no threading)
         gmail_service = self._get_gmail_service(sender_email)
         result = gmail_service.send_email(
             to_email=recipient_email,
             to_name=recipient_name,
             from_name=sender_name,
             subject=subject,
-            html_body=html_body,
-            thread_id=reply_to_thread_id,
-            in_reply_to=in_reply_to,
-            references=references
+            html_body=html_body
         )
         
         # Update draft status (only if not test mode)
         if not test_mode:
+            update_data = {
+                "message_id": result["message_id"],
+                "thread_id": result["thread_id"]
+            }
+            # Mark followups so they don't trigger new followups
+            if is_followup:
+                update_data["no_followup"] = True
+            
             self._repository.mark_draft_sent(
                 draft_id=draft_id,
                 message_id=result["message_id"],
                 thread_id=result["thread_id"]
             )
+            # Update no_followup flag separately
+            if is_followup:
+                self._repository.update_draft(draft_id, {"no_followup": True})
         
         logger.info(
             "Draft sent successfully",
@@ -222,6 +239,10 @@ class DraftService:
             test_mode=test_mode
         )
         
+        # Schedule followups for non-test, non-followup emails
+        if not test_mode and not is_followup:
+            self._schedule_followups(draft_id)
+        
         return {
             "success": True,
             "message_id": result["message_id"],
@@ -229,6 +250,56 @@ class DraftService:
             "recipient": recipient_email,
             "draft_id": draft_id
         }
+    
+    def _schedule_followups(self, draft_id: str) -> None:
+        """
+        Schedule followup emails for a sent draft.
+        
+        Calls the auto-followup service to schedule followups.
+        Fails silently to not block the main send operation.
+        
+        Args:
+            draft_id: The draft ID to schedule followups for.
+        """
+        settings = get_settings()
+        
+        if not settings.auto_followup.enabled:
+            logger.debug("Auto-followup disabled, skipping", draft_id=draft_id)
+            return
+        
+        auto_followup_url = settings.services.auto_followup_url.rstrip("/")
+        if not auto_followup_url:
+            logger.warning("AUTO_FOLLOWUP_URL not configured, skipping followup scheduling")
+            return
+        
+        try:
+            logger.info("Scheduling followups", draft_id=draft_id, url=auto_followup_url)
+            
+            response = requests.post(
+                f"{auto_followup_url}/schedule-followups",
+                json={"draft_id": draft_id},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(
+                    "Followups scheduled successfully",
+                    draft_id=draft_id,
+                    scheduled_count=result.get("scheduled_count", 0),
+                    followup_ids=result.get("followup_ids", [])
+                )
+            else:
+                logger.warning(
+                    "Failed to schedule followups",
+                    draft_id=draft_id,
+                    status_code=response.status_code,
+                    response=response.text[:200]
+                )
+        except requests.exceptions.Timeout:
+            logger.warning("Timeout scheduling followups", draft_id=draft_id)
+        except requests.exceptions.RequestException as e:
+            logger.warning("Error scheduling followups", draft_id=draft_id, error=str(e))
     
     @log_execution_time()
     def resend_to_another(

@@ -39,9 +39,7 @@ class GmailSettings(BaseSettings):
     )
     scopes: list[str] = Field(
         default=[
-            "https://www.googleapis.com/auth/gmail.compose",
-            "https://www.googleapis.com/auth/gmail.modify",
-            "https://www.googleapis.com/auth/gmail.readonly"
+            "https://mail.google.com/"
         ],
         description="OAuth2 scopes for Gmail API"
     )
@@ -103,6 +101,33 @@ class ServiceURLs(BaseSettings):
         alias="MAIL_TRACKER_URL",
         description="Mail tracker service URL"
     )
+    auto_followup_url: str = Field(
+        default="https://auto-followup-642098175556.europe-west1.run.app",
+        alias="AUTO_FOLLOWUP_URL",
+        description="Auto-followup service URL"
+    )
+
+
+class AutoFollowupSettings(BaseSettings):
+    """Auto-followup configuration."""
+    
+    model_config = SettingsConfigDict(extra="ignore")
+    
+    enabled: bool = Field(
+        default=True,
+        alias="ENABLE_AUTO_FOLLOWUP",
+        description="Enable automatic followup scheduling"
+    )
+    
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def validate_enabled(cls, v):
+        """Convert string to boolean."""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        return bool(v)
 
 
 class AppSettings(BaseSettings):
@@ -144,7 +169,7 @@ class AppSettings(BaseSettings):
     )
     service_account_email: str = Field(
         default="light-shutter@light-and-shutter.iam.gserviceaccount.com",
-        alias="SERVICE_ACCOUNT_EMAIL",
+        alias="GOOGLE_SERVICE_ACCOUNT_EMAIL",
         description="Service account email"
     )
     
@@ -153,6 +178,7 @@ class AppSettings(BaseSettings):
     tracking: TrackingSettings = Field(default_factory=TrackingSettings)
     firestore: FirestoreSettings = Field(default_factory=FirestoreSettings)
     services: ServiceURLs = Field(default_factory=ServiceURLs)
+    auto_followup: AutoFollowupSettings = Field(default_factory=AutoFollowupSettings)
     
     @field_validator("environment", mode="before")
     @classmethod

@@ -14,7 +14,6 @@ from email.mime.text import MIMEText
 from typing import Any, Optional, TypedDict
 
 import google.auth
-from google.auth import iam
 from google.auth.transport import requests as google_requests
 from google.oauth2 import service_account
 from googleapiclient import errors as gmail_errors
@@ -55,8 +54,8 @@ class GmailService:
         ... )
     """
     
-    # IAM credentials API endpoint
-    IAM_ENDPOINT = "https://iamcredentials.googleapis.com"
+    # Token URI for service account credentials
+    TOKEN_URI = "https://oauth2.googleapis.com/token"
     
     def __init__(
         self,
@@ -98,7 +97,10 @@ class GmailService:
         """
         Create authenticated Gmail service with domain-wide delegation.
         
-        Uses IAM credentials API for signing tokens in Cloud Run environment.
+        Uses Google's recommended approach for Cloud Run:
+        1. Get default credentials from the environment (Cloud Run SA)
+        2. Use the IAM Credentials API to sign a JWT
+        3. Exchange the signed JWT for an access token with subject claim
         
         Returns:
             Gmail API service resource.
@@ -110,33 +112,70 @@ class GmailService:
                 service_account=self._service_account_email
             )
             
-            # Get base credentials from environment
-            base_credentials, project = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/iam"]
+            import time
+            import json
+            import requests
+            
+            # Get the default credentials (Cloud Run's service account)
+            source_credentials, project = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
             
-            # Create signing credentials for domain-wide delegation
-            signer = iam.Signer(
-                google_requests.Request(),
-                base_credentials,
-                self._service_account_email
+            # Refresh to get access token
+            source_credentials.refresh(google_requests.Request())
+            
+            # Create JWT claims for domain-wide delegation
+            now = int(time.time())
+            claims = {
+                "iss": self._service_account_email,
+                "sub": self._delegated_user,  # The user to impersonate
+                "scope": " ".join(self._settings.gmail.scopes),
+                "aud": "https://oauth2.googleapis.com/token",
+                "iat": now,
+                "exp": now + 3600
+            }
+            
+            # Sign the JWT using IAM Credentials API
+            sign_url = f"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{self._service_account_email}:signJwt"
+            
+            sign_response = requests.post(
+                sign_url,
+                headers={
+                    "Authorization": f"Bearer {source_credentials.token}",
+                    "Content-Type": "application/json"
+                },
+                json={"payload": json.dumps(claims)}
             )
             
-            # Create delegated credentials
-            delegated_credentials = service_account.Credentials(
-                signer=signer,
-                service_account_email=self._service_account_email,
-                token_uri=f"{self.IAM_ENDPOINT}/v1/projects/-/serviceAccounts/"
-                          f"{self._service_account_email}:generateAccessToken",
-                scopes=self._settings.gmail.scopes,
-                subject=self._delegated_user
+            if sign_response.status_code != 200:
+                raise Exception(f"Failed to sign JWT: {sign_response.text}")
+            
+            signed_jwt = sign_response.json()["signedJwt"]
+            
+            # Exchange signed JWT for access token
+            token_response = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": signed_jwt
+                }
             )
+            
+            if token_response.status_code != 200:
+                raise Exception(f"Failed to get access token: {token_response.text}")
+            
+            access_token = token_response.json()["access_token"]
+            
+            # Create credentials with the access token
+            from google.oauth2.credentials import Credentials as OAuth2Credentials
+            
+            credentials = OAuth2Credentials(token=access_token)
             
             # Build Gmail service
             service = build(
                 "gmail",
                 "v1",
-                credentials=delegated_credentials,
+                credentials=credentials,
                 cache_discovery=False
             )
             
@@ -396,21 +435,22 @@ class GmailService:
         Returns:
             Base64url encoded email message.
         """
+        from email.utils import formataddr
+        
         # Create multipart message
         msg = MIMEMultipart("alternative")
         
-        # Set headers
-        if to_name:
-            msg["To"] = f'"{to_name}" <{to_email}>'
-        else:
-            msg["To"] = to_email
-        
-        if from_name:
-            msg["From"] = f'"{from_name}" <{self._delegated_user}>'
-        else:
-            msg["From"] = self._delegated_user
-        
+        # Set headers using formataddr for proper RFC 2822 encoding
+        msg["To"] = formataddr((to_name, to_email)) if to_name else to_email
+        msg["From"] = formataddr((from_name, self._delegated_user)) if from_name else self._delegated_user
         msg["Subject"] = subject
+        
+        logger.debug(
+            "Composing email",
+            to_header=msg["To"],
+            from_header=msg["From"],
+            subject=subject[:50]
+        )
         
         # Add threading headers
         if references:

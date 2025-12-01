@@ -72,9 +72,8 @@ def register_error_handlers(app: Flask) -> None:
     def handle_draft_creator_error(error: DraftCreatorError) -> tuple[Response, int]:
         """Handle custom application errors."""
         logger.error(
-            "Application error",
+            f"Application error: {error.message}",
             error_code=error.code.value,
-            message=error.message,
             context=error.context.to_dict() if error.context else None
         )
         
