@@ -177,7 +177,7 @@ class AppSettings(BaseSettings):
         description="Google Cloud region"
     )
     service_account_email: str = Field(
-        default="light-shutter@light-and-shutter.iam.gserviceaccount.com",
+        default="",
         alias="GOOGLE_SERVICE_ACCOUNT_EMAIL",
         description="Service account email"
     )

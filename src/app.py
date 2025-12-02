@@ -173,6 +173,60 @@ def register_routes(app: Flask) -> None:
             "version": "2.0.0"
         }), 200
     
+    @app.route("/draft/<draft_id>", methods=["GET"])
+    def get_draft(draft_id: str) -> tuple[Response, int]:
+        """
+        Get a draft by ID.
+        
+        Args:
+            draft_id: Firestore document ID
+        
+        Returns:
+            JSON response with draft data.
+        """
+        from google.cloud import firestore
+        
+        settings = get_settings()
+        db = firestore.Client()
+        
+        draft_ref = db.collection(settings.firestore.drafts_collection).document(draft_id)
+        draft_doc = draft_ref.get()
+        
+        if not draft_doc.exists:
+            raise DraftNotFoundError(draft_id=draft_id)
+        
+        draft_data = draft_doc.to_dict()
+        draft_data["id"] = draft_doc.id
+        
+        return jsonify(draft_data), 200
+    
+    @app.route("/drafts/fields", methods=["GET"])
+    def get_all_draft_fields() -> tuple[Response, int]:
+        """
+        Get all unique fields found across all drafts.
+        
+        Returns:
+            JSON response with list of unique field names.
+        """
+        from google.cloud import firestore
+        
+        settings = get_settings()
+        db = firestore.Client()
+        
+        unique_fields = set()
+        
+        # Parcourir tous les drafts
+        drafts_ref = db.collection(settings.firestore.drafts_collection)
+        for doc in drafts_ref.stream():
+            draft_data = doc.to_dict()
+            if draft_data:
+                unique_fields.update(draft_data.keys())
+        
+        return jsonify({
+            "fields": sorted(list(unique_fields)),
+            "count": len(unique_fields)
+        }), 200
+    
     @app.route("/", methods=["POST"])
     def create_draft() -> tuple[Response, int]:
         """
