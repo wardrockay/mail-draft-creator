@@ -627,6 +627,83 @@ def register_routes(app: Flask) -> None:
                 "message": f"Failed to delete draft: {str(e)}",
                 "deleted": deleted
             }), 500
+    
+    @app.route("/debug/check-followup-thread-fields", methods=["GET"])
+    def debug_check_followup_thread_fields() -> tuple[Response, int]:
+        """
+        Vérifier si tous les drafts avec followup_number > 0 ont les champs thread nécessaires.
+        
+        Vérifie la présence de:
+        - reply_to_message_id
+        - reply_to_thread_id
+        
+        Returns:
+            JSON response avec statistiques et liste des drafts manquants.
+        """
+        from google.cloud import firestore
+        
+        settings = get_settings()
+        db = firestore.Client()
+        
+        # Récupérer tous les drafts de relance
+        drafts_ref = db.collection(settings.firestore.drafts_collection).where(
+            "followup_number", ">", 0
+        )
+        
+        total_followups = 0
+        with_both_fields = 0
+        missing_reply_to_message = 0
+        missing_reply_to_thread = 0
+        missing_both = 0
+        
+        drafts_with_issues = []
+        
+        for doc in drafts_ref.stream():
+            total_followups += 1
+            draft_data = doc.to_dict()
+            
+            has_message_id = bool(draft_data.get("reply_to_message_id"))
+            has_thread_id = bool(draft_data.get("reply_to_thread_id"))
+            
+            if has_message_id and has_thread_id:
+                with_both_fields += 1
+            else:
+                issue = {
+                    "draft_id": doc.id,
+                    "followup_number": draft_data.get("followup_number"),
+                    "to": draft_data.get("to"),
+                    "status": draft_data.get("status"),
+                    "x_external_id": draft_data.get("x_external_id"),
+                    "has_reply_to_message_id": has_message_id,
+                    "has_reply_to_thread_id": has_thread_id,
+                }
+                
+                if not has_message_id and not has_thread_id:
+                    missing_both += 1
+                    issue["missing"] = "both"
+                elif not has_message_id:
+                    missing_reply_to_message += 1
+                    issue["missing"] = "reply_to_message_id"
+                else:
+                    missing_reply_to_thread += 1
+                    issue["missing"] = "reply_to_thread_id"
+                
+                drafts_with_issues.append(issue)
+        
+        logger.info(
+            f"Vérification thread fields: {total_followups} followups, {with_both_fields} avec les 2 champs"
+        )
+        
+        return jsonify({
+            "total_followup_drafts": total_followups,
+            "with_both_fields": with_both_fields,
+            "missing_reply_to_message_id": missing_reply_to_message,
+            "missing_reply_to_thread_id": missing_reply_to_thread,
+            "missing_both_fields": missing_both,
+            "percentage_complete": round((with_both_fields / total_followups * 100), 2) if total_followups > 0 else 0,
+            "drafts_with_issues": drafts_with_issues[:50],  # Limiter à 50 pour lisibilité
+            "total_issues": len(drafts_with_issues)
+        }), 200
 
 
 # Create application instance
