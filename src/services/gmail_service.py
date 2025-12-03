@@ -228,61 +228,89 @@ class GmailService:
         Raises:
             GmailSendError: If sending fails.
         """
-        try:
-            message = self._compose_email(
-                to_email=to_email,
-                to_name=to_name,
-                from_name=from_name,
-                subject=subject,
-                html_body=html_body,
-                references=references,
-                in_reply_to=in_reply_to
-            )
-            
-            body: dict[str, Any] = {"raw": message}
-            if thread_id:
-                body["threadId"] = thread_id
-            
-            result = (
-                self.gmail.users()
-                .messages()
-                .send(userId="me", body=body)
-                .execute()
-            )
-            
-            logger.info(
-                "Email sent successfully",
-                message_id=result.get("id"),
-                thread_id=result.get("threadId"),
-                to_email=to_email
-            )
-            
-            return EmailResult(
-                message_id=result.get("id", ""),
-                thread_id=result.get("threadId", ""),
-                label_ids=result.get("labelIds", [])
-            )
-            
-        except gmail_errors.HttpError as e:
-            logger.error(
-                "Gmail API error",
-                error=str(e),
-                to_email=to_email,
-                subject=subject
-            )
-            raise GmailSendError(
-                message=f"Gmail API error: {e}",
-                recipient=to_email,
-                context=ErrorContext(operation="send_email"),
-                cause=e
-            )
-        except Exception as e:
-            logger.error("Failed to send email", error=str(e), to_email=to_email)
-            raise GmailSendError(
-                message=f"Failed to send email: {e}",
-                recipient=to_email,
-                cause=e
-            )
+        max_retries = 3
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                message = self._compose_email(
+                    to_email=to_email,
+                    to_name=to_name,
+                    from_name=from_name,
+                    subject=subject,
+                    html_body=html_body,
+                    references=references,
+                    in_reply_to=in_reply_to
+                )
+                
+                body: dict[str, Any] = {"raw": message}
+                if thread_id:
+                    body["threadId"] = thread_id
+                
+                result = (
+                    self.gmail.users()
+                    .messages()
+                    .send(userId="me", body=body)
+                    .execute()
+                )
+                
+                logger.info(
+                    "Email sent successfully",
+                    message_id=result.get("id"),
+                    thread_id=result.get("threadId"),
+                    to_email=to_email,
+                    attempt=attempt + 1
+                )
+                
+                return EmailResult(
+                    message_id=result.get("id", ""),
+                    thread_id=result.get("threadId", ""),
+                    label_ids=result.get("labelIds", [])
+                )
+                
+            except (BrokenPipeError, ConnectionError, OSError) as e:
+                last_exception = e
+                logger.warning(
+                    f"Connection error sending email (attempt {attempt + 1}/{max_retries}): {e}",
+                    to_email=to_email
+                )
+                if attempt < max_retries - 1:
+                    # Refresh service and retry
+                    self.refresh_service()
+                    import time
+                    time.sleep(1)  # Wait longer between send retries
+                    
+            except gmail_errors.HttpError as e:
+                logger.error(
+                    "Gmail API error",
+                    error=str(e),
+                    to_email=to_email,
+                    subject=subject
+                )
+                raise GmailSendError(
+                    message=f"Gmail API error: {e}",
+                    recipient=to_email,
+                    context=ErrorContext(operation="send_email"),
+                    cause=e
+                )
+            except Exception as e:
+                last_exception = e
+                logger.error("Failed to send email", error=str(e), to_email=to_email)
+                # Don't retry on unknown exceptions
+                break
+        
+        # If we get here, all retries failed
+        logger.error(
+            "Failed to send email after all retries",
+            error=str(last_exception),
+            to_email=to_email,
+            attempts=max_retries
+        )
+        raise GmailSendError(
+            message=f"Failed to send email: {last_exception}",
+            recipient=to_email,
+            cause=last_exception
+        )
     
     def create_draft(
         self,
@@ -483,33 +511,49 @@ class GmailService:
         Returns:
             HTML signature string, or empty string if not found.
         """
-        try:
-            send_as = (
-                self.gmail.users()
-                .settings()
-                .sendAs()
-                .get(userId="me", sendAsEmail=self._delegated_user)
-                .execute()
-            )
-            
-            signature = send_as.get("signature", "")
-            
-            # Add alt="" to img tags that don't have one
-            if signature and "<img" in signature:
-                import re
-                signature = re.sub(
-                    r'<img(?![^>]*\balt\s*=)([^>]*)>',
-                    r'<img alt=""\1>',
-                    signature,
-                    flags=re.IGNORECASE
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                send_as = (
+                    self.gmail.users()
+                    .settings()
+                    .sendAs()
+                    .get(userId="me", sendAsEmail=self._delegated_user)
+                    .execute()
                 )
-            
-            logger.debug("Signature retrieved", signature_length=len(signature))
-            return signature
-            
-        except Exception as e:
-            logger.warning(f"Could not retrieve signature: {e}")
-            return ""
+                
+                signature = send_as.get("signature", "")
+                
+                # Add alt="" to img tags that don't have one
+                if signature and "<img" in signature:
+                    import re
+                    signature = re.sub(
+                        r'<img(?![^>]*\balt\s*=)([^>]*)>',
+                        r'<img alt=""\1>',
+                        signature,
+                        flags=re.IGNORECASE
+                    )
+                
+                logger.debug("Signature retrieved", signature_length=len(signature))
+                return signature
+                
+            except (BrokenPipeError, ConnectionError, OSError) as e:
+                logger.warning(
+                    f"Connection error retrieving signature (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                if attempt < max_retries - 1:
+                    # Refresh service and retry
+                    self.refresh_service()
+                    import time
+                    time.sleep(0.5)
+                else:
+                    logger.warning("Failed to retrieve signature after retries, continuing without it")
+                    return ""
+            except Exception as e:
+                logger.warning(f"Could not retrieve signature: {e}")
+                return ""
+        
+        return ""
 
 
 class GmailServiceFactory:
