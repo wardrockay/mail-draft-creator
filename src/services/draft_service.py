@@ -294,8 +294,18 @@ class DraftService:
         )
         
         # Schedule followups for non-test, non-followup emails
+        # CRITICAL: Check is_followup to prevent scheduling followups on followup drafts
         if not test_mode and not is_followup:
+            logger.info(f"Draft {draft_id} is eligible for followups, scheduling...", draft_id=draft_id)
             self._schedule_followups(draft_id)
+        elif is_followup:
+            logger.warning(
+                f"⚠️ Draft {draft_id} is a FOLLOWUP (followup_number={draft_data.get('followup_number', 0)}), "
+                f"SKIPPING followup scheduling to prevent infinite loop",
+                draft_id=draft_id,
+                followup_number=draft_data.get('followup_number', 0),
+                is_followup=True
+            )
         
         response = {
             "success": True,
@@ -329,6 +339,28 @@ class DraftService:
         auto_followup_url = settings.services.auto_followup_url.rstrip("/")
         if not auto_followup_url:
             logger.warning("AUTO_FOLLOWUP_URL not configured, skipping followup scheduling")
+            return
+        
+        # DOUBLE PROTECTION: Reload draft from Firestore to verify current state
+        # This is critical because no_followup flag is set AFTER this function is called
+        draft = self._repository.get_draft_raw(draft_id)
+        
+        # Skip if no_followup is already set (safety check)
+        if draft.get("no_followup", False):
+            logger.warning(
+                "🛡️ DOUBLE PROTECTION: Draft has no_followup=True, skipping followup scheduling",
+                draft_id=draft_id
+            )
+            return
+        
+        # Skip if this is a followup draft (followup_number > 0 or is_followup=True)
+        if draft.get("followup_number", 0) > 0 or draft.get("is_followup", False):
+            logger.warning(
+                "🛡️ DOUBLE PROTECTION: Draft is a followup, should not schedule more followups",
+                draft_id=draft_id,
+                followup_number=draft.get("followup_number"),
+                is_followup=draft.get("is_followup")
+            )
             return
         
         try:
