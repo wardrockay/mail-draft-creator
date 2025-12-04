@@ -277,7 +277,7 @@ def save_draft_to_firestore(to, subject, body, x_external_id="", version_group_i
         raise
 
 
-def create_or_send_email(service, to, subject, body, mode="draft", x_external_id="", version_group_id="", odoo_id=None, contact_info=None, reply_to_thread_id=None, reply_to_message_id=None):
+def create_or_send_email(service, to, subject, body, mode="draft", x_external_id="", version_group_id="", odoo_id=None, contact_info=None, reply_to_thread_id=None, reply_to_message_id=None, draft_id=None):
     """
     Crée un brouillon Firestore OU envoie directement l'email en HTML :
     - mode="draft": sauvegarde dans Firestore pour review humain
@@ -291,10 +291,11 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         contact_info: dict optionnel (les infos sont récupérées depuis Odoo via x_external_id lors des relances)
         reply_to_thread_id: ID du thread Gmail pour envoyer en réponse (pour les relances)
         reply_to_message_id: ID du message Gmail original pour le header References (pour les relances)
+        draft_id: ID du draft Firestore (pour ajouter dans les headers X- personnalisés)
         
     Returns:
-        Pour mode="draft": (draft_id, None, None, version_group_id)
-        Pour mode="send": (gmail_message_id, gmail_thread_id, pixel_id, version_group_id)
+        Pour mode="draft": (draft_id, None, None, None, version_group_id)
+        Pour mode="send": (gmail_api_message_id, gmail_message_id_long, gmail_thread_id, pixel_id, version_group_id)
     """
     debug("CREATE_OR_SEND_EMAIL INPUT", {
         "to": to,
@@ -307,12 +308,13 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
         "contact_info": contact_info,
         "reply_to_thread_id": reply_to_thread_id,
         "reply_to_message_id": reply_to_message_id,
+        "draft_id": draft_id,
     })
 
     # En mode draft, on sauvegarde dans Firestore au lieu de créer un draft Gmail
     if mode == "draft":
         draft_id, version_group_id = save_draft_to_firestore(to, subject, body, x_external_id, version_group_id, odoo_id, contact_info)
-        return draft_id, None, None, version_group_id
+        return draft_id, None, None, None, version_group_id
 
     # Générer un ID unique pour le pixel
     pixel_id = str(uuid.uuid4())
@@ -382,6 +384,15 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
     msg["To"] = to
     msg["Subject"] = subject
     
+    # Headers personnalisés pour le rapprochement des réponses (prioritaire)
+    if draft_id:
+        msg["X-Draft-ID"] = draft_id
+    if x_external_id:
+        msg["X-Prospect-ID"] = x_external_id
+    if odoo_id:
+        msg["X-Odoo-ID"] = str(odoo_id)
+    msg["X-Campaign"] = "prospection-2025"
+    
     # Si c'est une réponse dans un thread, ajouter les headers de référence
     if reply_to_message_id:
         # Format: <message_id@mail.gmail.com>
@@ -413,13 +424,33 @@ def create_or_send_email(service, to, subject, body, mode="draft", x_external_id
     ).execute()
     debug("MESSAGE SENT RESPONSE", sent)
     
-    # Récupérer le message_id et thread_id de la réponse Gmail
-    gmail_message_id = sent.get("id")
+    # Récupérer le message_id court (API Gmail) et thread_id
+    gmail_api_message_id = sent.get("id")
     gmail_thread_id = sent.get("threadId")
     
-    debug("MESSAGE IDS", {"message_id": gmail_message_id, "thread_id": gmail_thread_id})
+    # Récupérer le message complet pour extraire le Message-ID (format long avec <>)
+    gmail_message_id_long = None
+    try:
+        full_message = service.users().messages().get(
+            userId="me",
+            id=gmail_api_message_id,
+            format='full'
+        ).execute()
+        
+        headers = full_message.get('payload', {}).get('headers', [])
+        message_id_header = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), None)
+        
+        if message_id_header:
+            gmail_message_id_long = message_id_header
+            debug("MESSAGE-ID EXTRACTED", {"short_id": gmail_api_message_id, "long_id": gmail_message_id_long})
+        else:
+            debug("MESSAGE-ID NOT FOUND", {"using_short_id_only": gmail_api_message_id})
+    except Exception as e:
+        debug("ERROR EXTRACTING MESSAGE-ID", {"error": str(e), "using_short_id_only": gmail_api_message_id})
     
-    return gmail_message_id, gmail_thread_id, pixel_id, version_group_id
+    debug("MESSAGE IDS", {"short_id": gmail_api_message_id, "long_id": gmail_message_id_long, "thread_id": gmail_thread_id})
+    
+    return gmail_api_message_id, gmail_message_id_long, gmail_thread_id, pixel_id, version_group_id
 
 
 # --- HTTP endpoint (Cloud Run) ---------------------------------------
@@ -502,11 +533,11 @@ def root():
         service = get_gmail_service()
         debug("GMAIL SERVICE READY")
 
-        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, message, mode, x_external_id, version_group_id, odoo_id, contact_info)
-        debug("RESPONSE SENT", {"mode": mode, "gmail_message_id": gmail_message_id, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
+        gmail_api_message_id, gmail_message_id_long, gmail_thread_id, pixel_id, _ = create_or_send_email(service, to, subject, message, mode, x_external_id, version_group_id, odoo_id, contact_info)
+        debug("RESPONSE SENT", {"mode": mode, "gmail_api_message_id": gmail_api_message_id, "gmail_message_id_long": gmail_message_id_long, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
 
         return jsonify(
-            {"status": "ok", "mode": mode, "id": gmail_message_id, "thread_id": gmail_thread_id, "pixel_id": pixel_id}
+            {"status": "ok", "mode": mode, "id": gmail_api_message_id, "message_id_long": gmail_message_id_long, "thread_id": gmail_thread_id, "pixel_id": pixel_id}
         ), 200
 
     except Exception as e:
@@ -598,10 +629,13 @@ def send_draft():
         debug("GMAIL SERVICE READY")
         
         # Envoyer l'email avec le pixel de tracking (et dans le thread si c'est une relance)
-        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(
+        gmail_api_message_id, gmail_message_id_long, gmail_thread_id, pixel_id, _ = create_or_send_email(
             service, to, subject, body, mode="send",
             reply_to_thread_id=reply_to_thread_id,
-            reply_to_message_id=reply_to_message_id
+            reply_to_message_id=reply_to_message_id,
+            draft_id=draft_id,  # Pour header X-Draft-ID
+            x_external_id=draft_data.get('x_external_id', ''),
+            odoo_id=draft_data.get('odoo_id')
         )
         
         # En mode test, on ne met pas à jour le statut du draft
@@ -610,14 +644,14 @@ def send_draft():
             doc_ref.update({
                 "status": "sent",
                 "sent_at": now_utc(),
-                "message_id": gmail_message_id,
-                "gmail_message_id": gmail_message_id,  # Pour la détection de réponses
+                "message_id": gmail_message_id_long,  # ID long (Message-ID header) pour détection de réponses
+                "gmail_api_message_id": gmail_api_message_id,  # ID court (API Gmail)
                 "gmail_thread_id": gmail_thread_id,    # Pour la détection de réponses
                 "pixel_id": pixel_id,
                 "has_reply": False,  # Initialiser à False
             })
             
-            debug("DRAFT SENT", {"gmail_message_id": gmail_message_id, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
+            debug("DRAFT SENT", {"gmail_api_message_id": gmail_api_message_id, "gmail_message_id_long": gmail_message_id_long, "gmail_thread_id": gmail_thread_id, "pixel_id": pixel_id})
             
             # Planifier les relances automatiques si activé
             if ENABLE_AUTO_FOLLOWUP and AUTO_FOLLOWUP_URL:
@@ -636,11 +670,12 @@ def send_draft():
                 except Exception as e:
                     debug("ERROR CALLING AUTO_FOLLOWUP", {"error": str(e)})
         else:
-            debug("TEST EMAIL SENT (draft status not updated)", {"to": test_email, "gmail_message_id": gmail_message_id})
+            debug("TEST EMAIL SENT (draft status not updated)", {"to": test_email, "gmail_api_message_id": gmail_api_message_id, "gmail_message_id_long": gmail_message_id_long})
         
         return jsonify({
             "status": "ok",
-            "message_id": gmail_message_id,
+            "message_id": gmail_api_message_id,
+            "message_id_long": gmail_message_id_long,
             "thread_id": gmail_thread_id,
             "pixel_id": pixel_id,
             "test_mode": test_mode,
@@ -714,14 +749,20 @@ def resend_to_another():
         debug("GMAIL SERVICE READY")
         
         # Envoyer l'email à la nouvelle adresse (avec un nouveau pixel de tracking)
-        gmail_message_id, gmail_thread_id, pixel_id, _ = create_or_send_email(service, new_email, subject, body, mode="send")
+        gmail_api_message_id, gmail_message_id_long, gmail_thread_id, pixel_id, _ = create_or_send_email(
+            service, new_email, subject, body, mode="send",
+            draft_id=draft_id,
+            x_external_id=draft_data.get('x_external_id', ''),
+            odoo_id=draft_data.get('odoo_id')
+        )
         
         # Enregistrer le renvoi dans le draft original
         resends = draft_data.get("resends", [])
         resends.append({
             "to": new_email,
             "sent_at": now_utc().isoformat(),
-            "gmail_message_id": gmail_message_id,
+            "message_id": gmail_message_id_long,
+            "gmail_api_message_id": gmail_api_message_id,
             "gmail_thread_id": gmail_thread_id,
             "pixel_id": pixel_id
         })
@@ -733,14 +774,16 @@ def resend_to_another():
         
         debug("RESEND COMPLETED", {
             "new_email": new_email,
-            "gmail_message_id": gmail_message_id,
+            "gmail_api_message_id": gmail_api_message_id,
+            "gmail_message_id_long": gmail_message_id_long,
             "gmail_thread_id": gmail_thread_id,
             "pixel_id": pixel_id
         })
         
         return jsonify({
             "status": "ok",
-            "message_id": gmail_message_id,
+            "message_id": gmail_api_message_id,
+            "message_id_long": gmail_message_id_long,
             "thread_id": gmail_thread_id,
             "pixel_id": pixel_id,
             "resent_to": new_email,
