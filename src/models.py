@@ -272,6 +272,7 @@ class EmailDraftDTO(BaseModel):
     message_id: Optional[str] = None
     thread_id: Optional[str] = None
     followup_number: int = 0
+    initial_draft_id: Optional[str] = None
     notes: str = ""
     
     @classmethod
@@ -292,6 +293,7 @@ class EmailDraftDTO(BaseModel):
             message_id=data.get("message_id"),
             thread_id=data.get("thread_id"),
             followup_number=data.get("followup_number", 0),
+            initial_draft_id=data.get("initial_draft_id"),
             notes=data.get("notes", "")
         )
 

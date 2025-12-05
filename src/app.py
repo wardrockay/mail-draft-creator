@@ -271,6 +271,7 @@ def register_routes(app: Flask) -> None:
         reply_to_message_id = data.get("reply_to_message_id", "")
         original_subject = data.get("original_subject", "")
         followup_number = data.get("followup_number", 0)
+        initial_draft_id = data.get("initial_draft_id")  # ID du draft initial pour les relances
         
         # Contact info
         contact_info = {
@@ -307,6 +308,8 @@ def register_routes(app: Flask) -> None:
         if followup_number > 0:
             draft_data["followup_number"] = followup_number
             draft_data["is_followup"] = True
+        if initial_draft_id:
+            draft_data["initial_draft_id"] = initial_draft_id
         
         # Add contact info
         for key, value in contact_info.items():
