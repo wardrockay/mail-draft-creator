@@ -246,6 +246,7 @@ def register_routes(app: Flask) -> None:
             - error_message: (optional) Error message if status="error"
             - reply_to_thread_id, reply_to_message_id, original_subject: Thread info for followups
             - followup_number: (optional) Followup number (1-4)
+            - agent_instruction_id: (optional) ID de l'instruction agent utilisée pour générer le mail
         
         Returns:
             JSON response with draft_id and version_group_id.
@@ -272,6 +273,7 @@ def register_routes(app: Flask) -> None:
         original_subject = data.get("original_subject", "")
         followup_number = data.get("followup_number", 0)
         initial_draft_id = data.get("initial_draft_id")  # ID du draft initial pour les relances
+        agent_instruction_id = data.get("agent_instruction_id")  # ID de l'instruction agent utilisée
         
         # Contact info
         contact_info = {
@@ -310,6 +312,8 @@ def register_routes(app: Flask) -> None:
             draft_data["is_followup"] = True
         if initial_draft_id:
             draft_data["initial_draft_id"] = initial_draft_id
+        if agent_instruction_id:
+            draft_data["agent_instruction_id"] = agent_instruction_id
         
         # Add contact info
         for key, value in contact_info.items():
@@ -326,7 +330,8 @@ def register_routes(app: Flask) -> None:
             "✅ Draft saved to Firestore",
             draft_id=draft_id,
             version_group_id=version_group_id,
-            is_followup=followup_number > 0
+            is_followup=followup_number > 0,
+            agent_instruction_id=agent_instruction_id
         )
         
         return jsonify({
@@ -630,6 +635,108 @@ def register_routes(app: Flask) -> None:
                 "message": f"Failed to delete draft: {str(e)}",
                 "deleted": deleted
             }), 500
+    
+    @app.route("/migrate-agent-instruction-ids", methods=["POST"])
+    def migrate_agent_instruction_ids() -> tuple[Response, int]:
+        """
+        Migrer les drafts pour ajouter l'agent_instruction_id.
+        
+        Pour chaque draft:
+        - Détermine le followup_number (0 si absent = mail initial)
+        - Trouve l'agent_instruction correspondante avec version_name="V1"
+        - Ajoute le champ agent_instruction_id
+        
+        Returns:
+            JSON response avec statistiques de migration.
+        """
+        from google.cloud import firestore
+        
+        settings = get_settings()
+        db = firestore.Client()
+        
+        logger.info("Début de la migration agent_instruction_ids")
+        
+        # Récupérer toutes les instructions V1 par followup_number
+        instructions_v1 = {}
+        instructions_ref = db.collection("agent_instructions").where("version_name", "==", "V1")
+        
+        for doc in instructions_ref.stream():
+            instruction_data = doc.to_dict()
+            followup_number = instruction_data.get("followup_number", 0)
+            instructions_v1[followup_number] = doc.id
+            logger.info(f"Instruction V1 trouvée: followup_number={followup_number}, id={doc.id}")
+        
+        if not instructions_v1:
+            logger.warning("Aucune instruction V1 trouvée dans la collection agent_instructions")
+            return jsonify({
+                "success": False,
+                "error": "Aucune instruction V1 trouvée",
+                "instructions_found": 0
+            }), 404
+        
+        # Récupérer tous les drafts
+        drafts_ref = db.collection(settings.firestore.drafts_collection)
+        
+        total_drafts = 0
+        updated_drafts = 0
+        skipped_drafts = 0
+        missing_instruction = 0
+        errors = []
+        
+        for doc in drafts_ref.stream():
+            total_drafts += 1
+            draft_data = doc.to_dict()
+            
+            # Vérifier si le draft a déjà un agent_instruction_id
+            if draft_data.get("agent_instruction_id"):
+                skipped_drafts += 1
+                continue
+            
+            # Déterminer le followup_number (0 si absent ou 0 = mail initial)
+            followup_number = draft_data.get("followup_number", 0)
+            
+            # Trouver l'instruction V1 correspondante
+            instruction_id = instructions_v1.get(followup_number)
+            
+            if not instruction_id:
+                missing_instruction += 1
+                logger.warning(
+                    f"Pas d'instruction V1 pour followup_number={followup_number}, draft_id={doc.id}"
+                )
+                continue
+            
+            # Mettre à jour le draft
+            try:
+                doc.reference.update({
+                    "agent_instruction_id": instruction_id
+                })
+                updated_drafts += 1
+                
+                if updated_drafts % 100 == 0:
+                    logger.info(f"Progression: {updated_drafts} drafts mis à jour")
+            
+            except Exception as e:
+                errors.append({
+                    "draft_id": doc.id,
+                    "error": str(e)
+                })
+                logger.error(f"Erreur lors de la mise à jour du draft {doc.id}: {e}")
+        
+        logger.info(
+            f"Migration terminée: {updated_drafts}/{total_drafts} drafts mis à jour, "
+            f"{skipped_drafts} ignorés (déjà migrés), {missing_instruction} sans instruction"
+        )
+        
+        return jsonify({
+            "success": True,
+            "total_drafts": total_drafts,
+            "updated_drafts": updated_drafts,
+            "skipped_drafts": skipped_drafts,
+            "missing_instruction": missing_instruction,
+            "instructions_v1_found": len(instructions_v1),
+            "instructions_mapping": {k: v for k, v in instructions_v1.items()},
+            "errors": errors if errors else None
+        }), 200
     
     @app.route("/debug/check-followup-thread-fields", methods=["GET"])
     def debug_check_followup_thread_fields() -> tuple[Response, int]:
